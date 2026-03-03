@@ -1,239 +1,293 @@
-# Reins Plan Validation Feedback (Codex)
+# Reins Docs Reality Check (Pi Framework Validation)
 
-Date: 2026-03-04
+**Scope reviewed:**
+- [PRD](./docs/PRD.md)
+- [ARCH](./docs/ARCH.md)
+- [UX-SPEC](./docs/UX-SPEC.md)
 
-Scope reviewed:
-- `docs/PRD.md`
-- `docs/ARCH.md`
-- `docs/UX-SPEC.md`
-
-Validation method:
-- Cross-checked against actual Pi extension framework source/docs in `~/projects/pi-mono/packages/coding-agent`
-- Verified extension APIs, event contracts, command contracts, tool registry, and lifecycle flow from code
-
-## Executive Summary
-
-The plan has strong intent (structural enforcement via extension hooks) and correctly identifies key Pi extension mechanisms (`before_agent_start`, `tool_call`). However, it is currently **not implementation-ready** because multiple core assumptions target APIs/tool names that are not the actual Pi surface.
-
-Overall rating: **3.5 / 10** for implementation readiness against current Pi reality.
-
-## What Is Correct
-
-1. `tool_call` hard blocking with `{ block: true, reason }` is real and correct.
-2. `before_agent_start` is the right place for per-turn prompt/system-prompt injection.
-3. The event is awaited before agent prompt execution.
-4. Extension discovery assumptions are mostly correct (global/project extension paths + settings + package `pi.extensions`).
-
-## Critical Gaps (Fix Before Build)
-
-### 1) Delegation model relies on non-existent tool names/APIs
-
-The docs repeatedly assume a delegate-only allowlist of tools like `subagents`, `sessions_spawn`, `message`, and `tts`, plus `subpi` as a built-in delegation primitive. That is not Pi’s built-in tool surface.
-
-Observed in Pi:
-- Built-in tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
-- Delegation is done via extensions (for example, the `subagent` example tool), not via built-in `sessions_spawn`/`message`/`tts` tool names.
-- The example subagent implementation spawns `pi` subprocesses directly (`spawn("pi", ...)`).
-
-Impact:
-- Current allowlist/blocklist logic in docs will block the wrong tools and fail to produce the intended behavior.
-- “Cuffed main agent” behavior is underspecified against actual available tools.
-
-Required fix:
-- Rebase the architecture on real tool names.
-- Decide whether Reins itself provides a delegation tool, or depends on a known installed delegation extension/tool (`subagent`).
-- Define enforcement rules in terms of actual registered tool names at runtime (`pi.getAllTools()` / `pi.getActiveTools()`).
+**Validation baseline:**
+- `~/projects/pi-mono/packages/coding-agent/docs/extensions.md`
+- `~/projects/pi-mono/packages/coding-agent/src/core/extensions/types.ts`
+- `~/projects/pi-mono/packages/coding-agent/src/core/extensions/runner.ts`
+- `~/projects/pi-mono/packages/coding-agent/src/core/extensions/wrapper.ts`
+- `~/projects/pi-mono/packages/coding-agent/src/core/agent-session.ts`
+- `~/projects/pi-mono/packages/coding-agent/examples/extensions/subagent/index.ts`
+- `~/projects/pi-mono/packages/coding-agent/examples/extensions/plan-mode/index.ts`
+- `~/projects/pi-mono/packages/coding-agent/src/core/extensions/loader.ts`
+- `~/projects/pi-mono/packages/coding-agent/src/core/settings-manager.ts`
 
 ---
 
-### 2) Command registration contract is wrong in code examples
+## Executive Rating
 
-Docs use:
-- `pi.registerCommand("reins", { async execute(...) { ... } })`
+**Overall plan quality: 5.5 / 10**
 
-Actual Pi expects:
-- `pi.registerCommand("reins", { handler: async (args, ctx) => { ... } })`
-
-Impact:
-- Commands won’t execute if implemented as shown.
-
-Required fix:
-- Replace all `execute` properties with `handler` in specs and examples.
+The direction is promising and uses the right extension surfaces (`before_agent_start`, `tool_call`, custom command/tool registration). However, too many implementation details currently conflict with actual Pi framework behavior and type contracts. In the current state, implementation would likely incur avoidable churn and breakages.
 
 ---
 
-### 3) Main-agent vs sub-agent detection is based on unsupported context fields
+## What Is Strong (Keep)
 
-Docs propose checking things like `ctx.parentSessionId` or `ctx.depth` to distinguish main agent from sub-agent turns. Those fields are not part of current `ExtensionContext`.
+1. **Core control points are correct**
+- Using `before_agent_start` for pre-turn prompt/system shaping and `tool_call` for hard guardrails is the right foundation.
 
-Impact:
-- “Only restrict main agent” logic is currently not implementable as described.
+2. **Block return shape is correct**
+- `{ block: true, reason: "..." }` is the correct `tool_call` result shape.
 
-Required fix:
-- Either:
-  1. Restrict by tool/turn behavior without relying on absent context fields, or
-  2. Implement a robust marker strategy (process/session-level separation, explicit flags in controlled paths), or
-  3. Accept that restrictions apply to all tool calls in this process and move delegation execution out-of-process.
+3. **Extension framing is mostly correct**
+- Pi extension model, event subscription, tool registration, command registration are correctly centered.
 
----
+4. **Default-off + graceful-failure product stance is good**
+- This is operationally sane and minimizes blast radius.
 
-### 4) Persistence model confusion (`appendEntry` is session scope, not global onboarding state)
-
-UX spec suggests using `pi.appendEntry("reins_onboarding", { shown: true })` for “first `/reins on` ever” onboarding state. `appendEntry` writes session entries, not durable global product settings.
-
-Impact:
-- “Shown once ever” behavior won’t hold across independent sessions/projects as intended.
-
-Required fix:
-- Persist onboarding and toggle state in settings (`~/.pi/agent/settings.json` and/or `.pi/settings.json`) or a dedicated extension-managed file.
-- Keep `appendEntry` for session analytics/history, not global feature flags.
+5. **Visibility/latency tradeoff is explicitly acknowledged**
+- The docs are candid that context building adds turn latency.
 
 ---
 
-### 5) Settings strategy ignores Pi’s two-scope merge model
+## Critical Gaps and Corrections
 
-Docs focus on `~/.pi/agent/settings.json` only. Pi supports both:
-- global: `~/.pi/agent/settings.json`
-- project: `.pi/settings.json`
-with project override/merge behavior.
+### 1) Sub-agent detection strategy is not grounded in Pi runtime
 
-Impact:
-- Ambiguous persistence behavior, especially for team/project-specific Reins policy.
+**Current docs claim:** use `process.env.SUBPI_SESSION_NAME` and assume `subpi` sets it.
 
-Required fix:
-- Define explicit precedence and write target for `/reins on|off` (global vs project).
-- Decide if `/reins` should support scope flags (e.g., `--global`, `--project`) or default policy.
+**Observed reality:**
+- No evidence in `pi-mono` of a framework-level `SUBPI_SESSION_NAME` contract.
+- Official subagent extension spawns `pi` subprocesses directly.
+
+**Why this matters:**
+- If this heuristic is wrong, you may accidentally restrict subagents (breaking delegation) or fail to restrict the top-level agent.
+
+**Fix:**
+- Mark top-level-vs-subagent detection as **unresolved implementation risk**, not “accepted ADR”.
+- Prefer explicit process-level contracts your own extension controls (e.g., set a dedicated env var on spawned subprocess and gate on that), then verify in end-to-end tests.
 
 ---
 
-### 6) Model identifier assumption likely invalid (`"sonnet"`)
+### 2) Tool names/capabilities mismatch in context builder design
 
-Docs use generic model strings like `sonnet` for builder config. Pi APIs/docs are oriented around concrete provider/model IDs (e.g., `claude-sonnet-4-5`).
+**Current docs claim:** builder gets `Read`, `Glob`, `Grep`, `Ls`.
 
-Impact:
-- Model resolution may fail unless custom mapping is implemented.
+**Observed reality:**
+- Built-ins are lowercase: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+- No built-in `glob` tool in the extension type definitions.
 
-Required fix:
-- Use concrete model IDs in config, or define an explicit alias-resolution layer.
+**Why this matters:**
+- Wrong tool names and nonexistent tool references will fail at runtime or create wrong assumptions for spawn restrictions.
 
-## Medium-Priority Improvements
+**Fix:**
+- Replace all capitalized tool names with actual Pi names.
+- Replace `Glob` with `find` and/or `grep` patterns.
+- Update all examples and allowlists consistently.
 
-### 7) Context builder execution details are underspecified for real Pi
+---
 
-The plan says “sub-process via `pi.exec()` + subpi” but does not pin actual command/protocol contract.
+### 3) Invalid API usage appears in implementation snippets
 
-Improve by specifying:
-1. exact subprocess invocation (`pi --mode json -p --no-session ...` style or equivalent)
-2. streaming parse contract for success/failure/timeout
-3. cancellation and cleanup behavior
-4. structured output schema for context blocks
+#### 3a) `ctx.ui.notify(..., "warn")`
+- Pi expects: `"info" | "warning" | "error"`.
+- `"warn"` is invalid.
 
-### 8) Tool-loop circuit-breaker wording uses non-framework API concepts
+#### 3b) `pi.sendMessage({ type: "text", text: ... })`
+- Pi expects custom-message shape with `customType`, `content`, `display`, `details`.
 
-UX text suggests escalation prompt says to delegate via `pi.exec()` as if model directly calls that. `pi.exec()` is extension API, not an LLM-callable built-in tool.
+**Why this matters:**
+- Snippets are currently misleading and not copy/paste-safe.
 
-Improve by:
-- Referring to actual LLM-callable delegation tool names.
-- Defining escalation as injected system prompt + optional `ctx.ui.notify` based on extension-side counters.
+**Fix:**
+- Make every code snippet type-correct against `extensions/types.ts`.
+- Add one “blessed minimal implementation” section that compiles as-is.
 
-### 9) Transparency requirement conflict across docs
+---
 
-PRD includes transparency user story; UX defers transparency to v2 and makes context injection fully invisible. This is a valid product choice, but currently contradictory.
+### 4) `appendEntry` is misused for global first-run onboarding state
 
-Improve by:
-- Marking US4 explicitly as deferred (v2) in PRD acceptance criteria and MVP scope.
+**Current docs claim:** persist “first activation shown” via `pi.appendEntry`.
 
-### 10) Claims about “zero impact when disabled” should be test-backed
+**Observed reality:**
+- `appendEntry` persists in session history, not a global settings flag across all sessions/projects.
 
-Architecturally reasonable, but should be validated with tests and instrumentation.
+**Fix:**
+- If global one-time onboarding is required, persist in settings file (or scoped settings key), not session entry stream.
 
-Improve by adding acceptance tests for:
-- no prompt modifications when disabled
-- no tool blocks when disabled
-- command toggling persists/reloads correctly
+---
 
-## Low-Priority / Clarity Improvements
+### 5) Prompt-chaining language is inaccurate
 
-### 11) Allowlist terminology drift (`subpi`, `subagent`, `subagents`)
+**Current docs imply:** Pi concatenates prompt injections.
 
-The docs use multiple variants for delegation mechanisms. Standardize naming and distinguish:
-- extension tool name(s)
-- subprocess executable (`pi`)
-- conceptual agent role names
+**Observed reality:**
+- `before_agent_start` handlers run in sequence; each receives current `systemPrompt` and can replace it. Chaining is cooperative, not automatic concatenation.
 
-### 12) Context source claims should map to concrete Pi APIs
+**Fix:**
+- Document exact semantics: each extension must append to `event.systemPrompt` when desired.
 
-Docs mention “memory, docs, past conversations.” Clarify exactly what “memory” means in Pi terms:
-- session entries via `ctx.sessionManager`
-- files in repo
-- extension custom entries
-- prompt/skill resources
+---
 
-### 13) Timeouts and partial-result semantics need deterministic contract
+### 6) Config key inconsistency (`contextModel` vs `model`)
 
-Current wording mixes partial/live and stale-cache fallback. Define a deterministic order:
-1. live complete
-2. live partial (if stream parser has data)
-3. stale cache
-4. none
+**Current docs conflict:**
+- PRD mentions `reins.contextModel`.
+- ARCH and snippets use `reins.model`.
 
-## Recommended Architecture Corrections (Concrete)
+**Fix:**
+- Standardize now on one key (`reins.model` is simpler) and update all docs/examples.
 
-1. **Delegation primitive**
-- Choose one:
-  - Depend on installed `subagent` extension tool (document dependency), or
-  - Bundle/register a Reins-owned delegation tool.
+---
 
-2. **Tool policy**
-- Use real runtime tool names from `pi.getAllTools()`.
-- Maintain a configurable allowlist of actual tool names.
-- Block all others in `tool_call` with explicit reason.
+### 7) `subpi` is treated as quasi-required despite no Pi API contract
 
-3. **Commands**
-- Implement `pi.registerCommand(... { handler })` only.
-- Define argument grammar for `/reins` and `/prework`.
+**Observed reality:**
+- Pi extension API provides `pi.exec(command, args, options)`, not `subpi` APIs.
+- Official example uses `spawn("pi", ...)` for subagents.
 
-4. **Scope-aware settings**
-- Decide if toggle is global, project, or both with precedence.
-- Persist state in settings, not in session entries.
+**Fix:**
+- Reframe `subpi` as optional ecosystem tool.
+- Make canonical path: spawn `pi` with JSON mode from extension logic.
+- If you keep `subpi` support, clearly define fallback order and detection.
 
-5. **Main/sub-agent boundary**
-- Remove unsupported `ctx.depth/parentSessionId` assumptions.
-- If needed, enforce boundary via subprocess architecture rather than in-process context fields.
+---
 
-6. **Builder model config**
-- Require explicit provider/model ID (e.g., `anthropic/claude-sonnet-4-5` pattern or equivalent internal representation).
+### 8) Tool-block UX assumptions are too optimistic
 
-## Suggested Acceptance Tests (Must Add)
+**Current UX claim:** user won’t see blocked attempts.
 
-1. `/reins on` persists and survives restart.
-2. `/reins off` restores unrestricted tool execution.
-3. When enabled, blocked tool calls return deterministic reason.
-4. Delegation tool remains callable while restricted.
-5. `before_agent_start` injection appears in effective system prompt only when enabled.
-6. Builder timeout path still allows turn to proceed.
-7. Builder failure path (including subprocess error) still allows turn to proceed.
-8. `/prework` injects next-turn-only context and then clears.
-9. Scope behavior works per chosen policy (global/project precedence).
+**Observed runtime path:**
+- Blocked tool calls are converted into execution errors with reason messages that can surface through normal message flow.
 
-## Source Anchors Used
+**Fix:**
+- Reword UX to “typically internal, but may surface indirectly depending on model behavior and output path.”
 
-- Pi extension API types/events/command contract/tool events:
-  - `~/projects/pi-mono/packages/coding-agent/src/core/extensions/types.ts`
-- Tool wrapping/block behavior:
-  - `~/projects/pi-mono/packages/coding-agent/src/core/extensions/wrapper.ts`
-- `before_agent_start` execution/await behavior:
-  - `~/projects/pi-mono/packages/coding-agent/src/core/agent-session.ts`
-  - `~/projects/pi-mono/packages/coding-agent/src/core/extensions/runner.ts`
-- Built-in tool registry:
-  - `~/projects/pi-mono/packages/coding-agent/src/core/tools/index.ts`
-- Extension docs (commands/events/exec/settings):
-  - `~/projects/pi-mono/packages/coding-agent/docs/extensions.md`
-  - `~/projects/pi-mono/packages/coding-agent/docs/settings.md`
-- Subagent reference implementation:
-  - `~/projects/pi-mono/packages/coding-agent/examples/extensions/subagent/index.ts`
-  - `~/projects/pi-mono/packages/coding-agent/examples/extensions/subagent/README.md`
+---
 
-## Final Assessment
+## Additional Design Improvements Needed
 
-The current Reins plan is promising but requires a **framework-reality rewrite** in its core delegation/tool policy sections before implementation. Once the tool model, command contract, settings scope, and main/sub-agent boundary are corrected to actual Pi behavior, this can become a strong and buildable v1.
+### 9) Move from speculative pseudo-code to “compilable baseline”
+
+Create one minimal vertical slice that is guaranteed type-correct:
+- `/reins on|off|status`
+- `before_agent_start` adds one deterministic line
+- `tool_call` allowlists one known tool (`reins_delegate`)
+- `reins_delegate` shells to `pi` subprocess
+
+Then layer context builder complexity afterward.
+
+---
+
+### 10) Clarify whether restrictions should apply to custom tools from other extensions
+
+Current model says “only delegation tool allowed.”
+
+Potential issue:
+- Other installed extensions may contribute critical safe tools.
+
+Recommendation:
+- Explicitly define policy mode:
+  - strict singleton (`reins_delegate` only), or
+  - bounded allowlist that can include third-party tools.
+
+---
+
+### 11) Tighten status telemetry definitions
+
+UX spec status output includes:
+- “Last context build Xs ago”
+- token counts
+- block counts
+
+These require explicit state tracking and timestamps.
+
+Recommendation:
+- Define exact data schema and reset semantics:
+  - reset per turn / per session / persisted?
+  - source of truth for token counts (builder output vs estimated)
+
+---
+
+### 12) Replace hardcoded token math heuristic with explicit limits strategy
+
+Current doc suggests rough chars/token truncation.
+
+Recommendation:
+- Keep heuristic as fallback but specify explicit safety behavior:
+  - max chars cap + max sections + file excerpt limits.
+- Prefer deterministic structured output from builder to reduce post-truncation risk.
+
+---
+
+### 13) Reduce architecture contradiction around tool visibility
+
+Docs currently say “visible but blocked is desired,” while also acknowledging `setActiveTools` could hide tools.
+
+Recommendation:
+- Choose one canonical mode for v1 and justify:
+  - visibility for teaching the model constraints vs
+  - hidden tools for reduced retries and token waste.
+- Add a config switch only if needed.
+
+---
+
+### 14) Add explicit test matrix before implementation starts
+
+Must-have tests:
+- Reins off: no behavior change.
+- Reins on: blocked built-ins fail with reason.
+- Delegation tool still callable.
+- Context builder timeout path.
+- Context builder hard failure path.
+- Command toggles persist via settings.
+- Multi-extension interaction ordering.
+- Non-interactive modes (`json`, `print`, `rpc`) where UI methods may no-op.
+
+---
+
+## Doc-Specific Feedback
+
+### PRD
+
+Improve:
+1. Unify config key naming (`model` vs `contextModel`).
+2. Replace unverified claims about subagent environment markers with explicit “to-be-validated” status.
+3. Add one non-goal: “Reins does not guarantee invisible failure of blocked tool calls.”
+4. Add measurable v1 success criterion tied to implementation reality (e.g., block rate trend, delegation success rate).
+
+### ARCH
+
+Improve:
+1. Remove/soften accepted ADRs that depend on unverified contracts (`SUBPI_SESSION_NAME`).
+2. Replace incorrect tool list/names with actual Pi built-ins.
+3. Fix all non-type-safe snippets.
+4. Add one reference implementation path based on existing `subagent` example.
+5. Clarify system prompt chaining semantics.
+6. Clarify config persistence API strategy (use settings manager style and atomic writes).
+
+### UX-SPEC
+
+Improve:
+1. Correct notification level names (`warning`, not `warn`).
+2. Reword hidden-block behavior to match runtime truth.
+3. Adjust first-run onboarding persistence approach.
+4. Explicitly describe behavior in no-UI contexts (status command behavior in rpc/print/json).
+5. Define exact semantics for counters and timestamps shown in `/reins status`.
+
+---
+
+## Recommended Rewrite Priorities (Order)
+
+1. **Correctness pass (must do first)**
+- API shapes, tool names, config key consistency, invalid snippet fixes.
+
+2. **Runtime-contract pass**
+- Replace speculative `subpi`/env assumptions with verified subprocess strategy.
+
+3. **Behavior-spec pass**
+- Finalize visibility policy, status schema, error-surface expectations.
+
+4. **Implementation-ready pass**
+- Add compile-checked minimal extension skeleton and concrete test plan.
+
+---
+
+## Suggested Updated Rating After Fixes
+
+If the above changes are made before coding begins, this plan should move to **8.0–8.5 / 10** and be implementation-ready with materially lower risk.
