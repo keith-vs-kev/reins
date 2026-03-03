@@ -5,7 +5,7 @@
 **Date:** 2026-03-03
 **Companion:** [PRD](./PRD.md)
 
-> **Reins is a Pi extension.** It hooks into the Pi coding agent's event system to constrain the main agent to delegation-only mode. Sub-agent work is performed by spawning `pi` sub-processes via `pi.exec()` (an extension-side API), or via any extension-provided sub-agent tool. `subpi` (a CLI tool on PATH) can also be used if available, but is not required.
+> **Reins is a Pi extension.** It hooks into the Pi coding agent's event system to constrain the main agent to delegation-only mode. The extension registers a `reins_delegate` tool via `pi.registerTool()` that internally spawns `pi` sub-processes using `pi.exec()` (an extension-side API, not LLM-callable).
 
 ---
 
@@ -23,15 +23,18 @@ reins/
 │   ├── commands/
 │   │   ├── reins.ts           # /reins on|off|status
 │   │   └── prework.ts         # /prework <prompt>
+│   ├── tools/
+│   │   └── delegate.ts        # reins_delegate tool definition
 │   ├── context-builder/
-│   │   ├── builder.ts         # Sub-agent orchestration + timeout wrapper
+│   │   ├── builder.ts         # Sub-process orchestration + timeout wrapper
 │   │   ├── prompt.ts          # System prompt template for the context builder
 │   │   └── cache.ts           # Stale-cache layer
-│   ├── config.ts              # Config reading from settings.json
+│   ├── config.ts              # Config reading from settings.json (two-scope)
 │   └── constants.ts           # Tool allowlist, timeouts, cache keys
 └── docs/
     ├── PRD.md
-    └── ARCH.md
+    ├── ARCH.md
+    └── UX-SPEC.md
 ```
 
 ### Discovery & Configuration
@@ -59,18 +62,38 @@ Pi extensions have **no manifest file**. Discovery is by convention:
 }
 ```
 
-Configuration lives in `~/.pi/agent/settings.json` under a `reins` key:
+### Settings (Two-Scope Model)
 
-```json
+Pi uses a two-scope settings model. Project settings override global settings:
+
+| Scope | Path | Precedence |
+|-------|------|-----------|
+| Global | `~/.pi/agent/settings.json` | Base defaults |
+| Project | `.pi/settings.json` | Overrides global |
+
+Reins configuration lives under a `reins` key in either scope:
+
+```jsonc
+// ~/.pi/agent/settings.json (global — applies everywhere)
 {
   "extensions": ["~/.pi/agent/extensions/reins/index.ts"],
   "reins": {
     "enabled": false,
-    "model": "sonnet",
+    "model": "claude-sonnet-4-20250514",
     "timeoutMs": 12000,
     "allowedTools": ["reins_delegate"],
     "cacheMaxAge": 300000,
     "debug": false
+  }
+}
+```
+
+```jsonc
+// .pi/settings.json (project — overrides global for this repo)
+{
+  "reins": {
+    "enabled": true,           // Override: always-on for this project
+    "model": "claude-haiku-4-20250414"  // Faster builder for this project
   }
 }
 ```
@@ -83,8 +106,10 @@ import { registerToolCall } from "./hooks/tool-call.js";
 import { registerBeforeAgentStart } from "./hooks/before-agent-start.js";
 import { registerReinsCommand } from "./commands/reins.js";
 import { registerPreworkCommand } from "./commands/prework.js";
+import { registerDelegateTool } from "./tools/delegate.js";
 
 export default function (pi: ExtensionAPI) {
+  registerDelegateTool(pi);
   registerToolCall(pi);
   registerBeforeAgentStart(pi);
   registerReinsCommand(pi);
@@ -92,7 +117,7 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-Registration uses `pi.on()` for lifecycle events and `pi.registerCommand()` for slash commands. The extension also registers a delegation tool (e.g. `reins_delegate`) via `pi.registerTool()` so the cuffed agent has a way to spawn sub-agents — Pi has no built-in delegation tool.
+Registration uses `pi.on()` for lifecycle events, `pi.registerCommand()` for slash commands, and `pi.registerTool()` for the delegation tool. Pi has no built-in delegation tool — Reins must provide one.
 
 ---
 
@@ -117,8 +142,7 @@ export function registerToolCall(pi: ExtensionAPI) {
     if (!config.enabled) return;
 
     // Only restrict main agent — sub-agents need full tool access.
-    // Sub-agents spawned by subpi/pi set SUBPI_SESSION_NAME env var.
-    // Main agent = no such env var. See ADR-002 for details.
+    // See ADR-002 for detection strategy.
     if (!isMainAgent()) return;
 
     const allowed = config.allowedTools ?? ALLOWED_TOOLS;
@@ -135,31 +159,39 @@ export function registerToolCall(pi: ExtensionAPI) {
 
 /**
  * Determine whether the current context is the main (top-level) agent.
- * Pi's ExtensionContext does not expose parentSessionId or depth.
- * Heuristic: sub-agents spawned via subpi set SUBPI_SESSION_NAME env var.
- * Absence of this env var indicates we're the main (top-level) agent.
+ *
+ * Pi's ExtensionContext does NOT expose depth, parentSessionId, or parentId.
+ * Heuristic: sub-agents spawned via the subagent extension or subpi set
+ * environment variables (e.g. SUBPI_SESSION_NAME or PI_SUBAGENT).
+ * Absence of these env vars indicates we're the main (top-level) agent.
+ *
+ * Alternative: apply restrictions universally. The reins_delegate tool
+ * spawns sub-agents as separate pi processes, which load their own
+ * extension instances. Since the sub-agent process won't have Reins
+ * enabled in its project settings (or will have it disabled via env),
+ * the restrictions naturally don't apply to sub-agents.
  */
 function isMainAgent(): boolean {
-  return !process.env.SUBPI_SESSION_NAME;
+  return !process.env.SUBPI_SESSION_NAME && !process.env.PI_SUBAGENT;
 }
 ```
 
 **Key decisions:**
 
-- **Only restricts the main agent** — sub-agents spawned by the main agent must have full tool access, otherwise the entire pattern collapses. The guard uses `isMainAgent()` which will be implemented based on what Pi's `ExtensionContext` exposes (see ADR-002).
-- **Returns `{ block: true, reason }` (not `blockReason`)** — this is the Pi extension return shape for `tool_call` events.
+- **Only restricts the main agent** — sub-agents spawned by the main agent must have full tool access, otherwise the entire pattern collapses. The guard uses `isMainAgent()` based on environment variables (see ADR-002).
+- **Returns `{ block: true, reason }` ** — this is the actual Pi extension return shape for `tool_call` events (typed as `ToolCallEventResult` in `types.ts`).
 - **Synchronous** — no async work, no allocations on the hot path when disabled.
 - **Configurable allowlist** — defaults from `ALLOWED_TOOLS`, overridable via settings.
 
 ### 2.2 `before_agent_start` — Soft Enforcement + Context Injection
 
-The complex hook. Async, spawns a context builder sub-agent, manages timeouts and cache.
+The complex hook. Async, spawns a context builder sub-process, manages timeouts and cache.
 
 > **Enabled guard (mandatory):** Same pattern — check enabled first, return immediately if off.
 
-> **Event timing:** `before_agent_start` fires **once per user prompt** — not before each internal tool/LLM turn. The context builder therefore runs once per prompt, not per turn.
+> **Event timing:** `before_agent_start` fires **once per user prompt** (before the agent loop starts), not before each internal tool/LLM turn. The context builder therefore runs once per prompt, not per turn.
 >
-> **Async guarantee:** This hook is `await`ed by the Pi runtime before the agent starts (confirmed in `runner.ts`). If this changes, the context injection strategy must be redesigned.
+> **Return type:** `BeforeAgentStartEventResult` — can include `systemPrompt` (string) and/or `message` (custom message). If multiple extensions return `systemPrompt`, they are chained.
 
 ```ts
 // hooks/before-agent-start.ts
@@ -178,14 +210,11 @@ export function registerBeforeAgentStart(pi: ExtensionAPI) {
     // Only affect main agent (see ADR-002)
     if (!isMainAgent()) return;
 
-    // Recursion guard — prevent the context builder sub-agent from
-    // triggering this hook again
-    if ((ctx as any).__reins_building_context) return;
-
     // 1. Build context (with timeout + cache fallback)
-    const prompt = extractPrompt(event);
+    // event.prompt is the user's prompt text (from BeforeAgentStartEvent)
+    // event.systemPrompt is the current system prompt
+    const prompt = event.prompt;
     const promptHash = hashPrompt(prompt);
-    const cacheKey = `${promptHash}`;
     let contextBlock: string | undefined;
     let partial = false;
 
@@ -206,20 +235,21 @@ export function registerBeforeAgentStart(pi: ExtensionAPI) {
 
       // Update cache on success
       if (contextBlock && !partial) {
-        contextCache.set(cacheKey, contextBlock, config.cacheMaxAge);
+        contextCache.set(promptHash, contextBlock, config.cacheMaxAge);
       }
     } catch {
       // Total failure — try stale cache
-      contextBlock = contextCache.get(cacheKey);
+      contextBlock = contextCache.get(promptHash);
       partial = !!contextBlock;
     }
 
-    // 2. Build system prompt injection
+    // 2. Build system prompt modification
     const parts: string[] = [
+      event.systemPrompt,
       "## Reins: Delegation-Only Mode\n\n" +
         "You are operating under Reins. You MUST NOT use tools directly except " +
         "`reins_delegate` (to spawn sub-agents). " +
-        "All implementation work — file reads, writes, shell commands, web searches — " +
+        "All implementation work — file reads, writes, shell commands — " +
         "must be delegated to sub-agents via `reins_delegate`.\n\n" +
         "If you attempt to call a blocked tool, it will be rejected. " +
         "Plan your delegation strategy, then spawn sub-agents to execute.",
@@ -230,19 +260,13 @@ export function registerBeforeAgentStart(pi: ExtensionAPI) {
       parts.push(`## Reins: Pre-gathered Context\n\n${marker}\n${contextBlock}`);
     }
 
-    // Pi's before_agent_start can inject systemPrompt content
+    // Return modified system prompt — Pi chains systemPrompt across extensions
     return { systemPrompt: parts.join("\n\n") };
   });
 }
 
-function extractPrompt(event: any): string {
-  // Extract the user's prompt from the event — exact field depends on
-  // Pi's before_agent_start event shape
-  return event.prompt ?? event.userMessage ?? "";
-}
-
 function isMainAgent(): boolean {
-  return !process.env.SUBPI_SESSION_NAME; // See ADR-002
+  return !process.env.SUBPI_SESSION_NAME && !process.env.PI_SUBAGENT;
 }
 
 /**
@@ -266,19 +290,107 @@ function truncateToTokenBudget(text: string, maxTokens: number): string {
 4. On timeout → inject partial result if available, else stale cache
 5. On total failure → stale cache or nothing
 6. Always inject delegation-only instruction regardless of context outcome
-7. Return `{ systemPrompt }` — Pi concatenates system prompt injections from extensions
+7. Return `{ systemPrompt }` — Pi chains system prompt modifications from multiple extensions
 
 ---
 
-## 3. Context Builder Sub-Agent
+## 3. Delegation Tool
+
+Pi has no built-in delegation tool. Its built-in LLM-callable tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Reins must register its own delegation tool so the cuffed agent can spawn sub-agents.
+
+### 3.1 Tool Registration
+
+```ts
+// tools/delegate.ts
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+
+export function registerDelegateTool(pi: ExtensionAPI) {
+  pi.registerTool({
+    name: "reins_delegate",
+    label: "Delegate",
+    description:
+      "Delegate a task to a sub-agent with full tool access. " +
+      "The sub-agent runs in an isolated context and returns a text result.",
+    parameters: Type.Object({
+      task: Type.String({ description: "Detailed task description for the sub-agent" }),
+      model: Type.Optional(
+        Type.String({
+          description: "Model ID override (e.g. claude-sonnet-4-20250514). Uses default if omitted.",
+        }),
+      ),
+      tools: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Tool subset for the sub-agent (e.g. ['read', 'bash', 'edit', 'write']). All tools if omitted.",
+        }),
+      ),
+    }),
+
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const config = getReinsConfig();
+      const model = params.model ?? config.model;
+      const args: string[] = ["--mode", "json", "-p", "--no-session"];
+
+      if (model) args.push("--model", model);
+      if (params.tools?.length) args.push("--tools", params.tools.join(","));
+
+      // Set env var so sub-agent's Reins hooks know not to restrict it
+      const env = { PI_SUBAGENT: "1" };
+
+      args.push(`Task: ${params.task}`);
+
+      // pi.exec() is an extension-side API — it runs a shell command,
+      // NOT an LLM tool. The LLM calls reins_delegate; the tool's
+      // execute() function uses pi.exec() internally.
+      const result = await pi.exec("pi", args, { signal });
+
+      if (result.code !== 0) {
+        return {
+          content: [{ type: "text", text: `Sub-agent failed (exit ${result.code}): ${result.stderr}` }],
+          isError: true,
+        };
+      }
+
+      // Parse JSON mode output to extract final assistant message
+      const output = extractFinalOutput(result.stdout);
+      return {
+        content: [{ type: "text", text: output || "(no output)" }],
+      };
+    },
+  });
+}
+```
+
+### 3.2 How It Works
+
+1. The LLM calls `reins_delegate` with a task description
+2. The tool's `execute()` function uses `pi.exec("pi", [...args])` to spawn a child `pi` process
+3. The child runs in JSON mode (`--mode json`), print mode (`-p`), with no session (`--no-session`)
+4. The child has full tool access (all built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`)
+5. The child's environment includes `PI_SUBAGENT=1` so if Reins is loaded there, it won't restrict the sub-agent
+6. Output is captured from stdout, parsed, and returned to the LLM
+
+### 3.3 Key Design Note: `pi.exec()` vs LLM Tools
+
+`pi.exec()` is an **extension-side API** — it executes shell commands from within extension code. The LLM agent **cannot** call `pi.exec()` directly. The flow is:
+
+```
+LLM calls reins_delegate (LLM tool) → execute() runs pi.exec() (extension API) → spawns pi subprocess
+```
+
+This distinction is critical: the LLM interacts with `reins_delegate` as a registered tool. The subprocess spawning is an implementation detail inside the tool's `execute()` function.
+
+---
+
+## 4. Context Builder Sub-Agent
 
 The context builder is the intelligence layer. It decides what the main agent needs to know before delegating.
 
-### 3.1 Execution Model
+### 4.1 Execution Model
 
-The context builder runs as a **sub-process spawned via `pi.exec()`** — an extension-side API (not an LLM tool). `pi.exec()` shells out to `subpi` or `pi` directly to run the builder as a sub-agent.
+The context builder runs as a **sub-process spawned via `pi.exec()`** — an extension-side API (not an LLM tool). It invokes `pi` directly in print+JSON mode.
 
-The builder is granted **read-only tools only**: `Read`, `Glob`, `Grep`, `Ls`. It cannot write, execute shell commands, or modify anything. It reads files, builds a structured summary, and returns it.
+The builder is granted **read-only tools only**: `read`, `grep`, `find`, `ls`. It cannot write, execute shell commands, or modify anything.
 
 ```ts
 // context-builder/builder.ts
@@ -295,16 +407,11 @@ export async function buildContextWithTimeout(opts: {
 }): Promise<BuildResult> {
   const { prompt, model, timeoutMs, pi } = opts;
 
-  const builderInput = formatBuilderInput(prompt);
-
-  // Spawn context builder as a sub-agent via pi.exec + subpi CLI.
-  // subpi is a CLI tool on PATH, not a Pi extension API.
-  // The exact invocation will depend on subpi's CLI interface.
   const buildPromise = spawnContextBuilder(pi, {
     systemPrompt: CONTEXT_BUILDER_SYSTEM_PROMPT,
-    userPrompt: builderInput,
+    userPrompt: `Gather context for the following user request:\n\n${prompt}`,
     model,
-    tools: ["Read", "Glob", "Grep", "Ls"],
+    tools: ["read", "grep", "find", "ls"],
   });
 
   const timeoutPromise = new Promise<BuildResult>((resolve) =>
@@ -318,69 +425,81 @@ async function spawnContextBuilder(
   pi: ExtensionAPI,
   opts: { systemPrompt: string; userPrompt: string; model: string; tools: string[] },
 ): Promise<BuildResult> {
-  // Implementation: use pi.exec() to invoke subpi CLI with appropriate args.
-  // subpi handles sub-agent lifecycle, tool restrictions, and result capture.
-  // Exact CLI interface TBD during implementation.
-  //
-  // Example (conceptual):
-  //   pi.exec("subpi", ["spawn", "--model", opts.model,
-  //     "--tools", opts.tools.join(","),
-  //     opts.userPrompt])  // prompt is positional, no --system flag
-  //
-  // Note: subpi spawn takes PROMPT as a positional argument.
-  // System prompt can be passed via env var or piped stdin.
-  //
-  throw new Error("Not yet implemented — see implementation spec");
-}
+  // Write system prompt to temp file for --append-system-prompt flag
+  const tmpFile = writeTempFile(opts.systemPrompt);
 
-function formatBuilderInput(prompt: string): string {
-  return `Gather context for the following user request:\n\n${prompt}`;
+  try {
+    const args = [
+      "--mode", "json",
+      "-p",
+      "--no-session",
+      "--model", opts.model,
+      "--tools", opts.tools.join(","),
+      "--append-system-prompt", tmpFile,
+      `Task: ${opts.userPrompt}`,
+    ];
+
+    const result = await pi.exec("pi", args, {});
+
+    if (result.code !== 0) {
+      return { context: undefined, partial: false };
+    }
+
+    const output = extractFinalOutput(result.stdout);
+    if (!output || output.trim() === "EMPTY") {
+      return { context: undefined, partial: false };
+    }
+
+    return { context: output, partial: false };
+  } finally {
+    cleanupTempFile(tmpFile);
+  }
 }
 ```
 
-### 3.2 What It Receives
+### 4.2 What It Receives
 
 | Input | Source | Purpose |
 |-------|--------|---------|
-| User's raw prompt | Extracted from `before_agent_start` event | Understand intent |
-| Read-only tools | `Read`, `Glob`, `Grep`, `Ls` | Gather file contents and structure |
+| User's raw prompt | `event.prompt` from `before_agent_start` event | Understand intent |
+| Read-only tools | `read`, `grep`, `find`, `ls` (Pi built-in tools, lowercase) | Gather file contents and structure |
 
-### 3.3 What It Does
+### 4.3 What It Does
 
-The context builder is a sub-agent with read-only tool access. It:
+The context builder is a sub-process with read-only tool access. It:
 
 1. Receives the user's prompt
-2. Uses `Glob` and `Ls` to explore the workspace structure
-3. Uses `Grep` to find relevant files
-4. Uses `Read` to pull file contents
+2. Uses `find` and `ls` to explore the workspace structure
+3. Uses `grep` to find relevant files
+4. Uses `read` to pull file contents
 5. Returns a structured markdown summary of relevant context
 
-### 3.4 What It Returns
+### 4.4 What It Returns
 
 A structured context block (plain text/markdown) containing any combination of:
 
 - **Relevant file contents** — files the main agent will need to reference when delegating
 - **Memory excerpts** — from MEMORY.md, daily logs, etc.
 - **Codebase structure** — directory trees, key file listings
-- **Nothing** — if the prompt is conversational or doesn't need codebase context
+- **Nothing** — if the prompt is conversational or doesn't need codebase context (returns "EMPTY")
 
 After the builder returns, the extension applies a **hard truncation cap** of 4000 tokens (see §2.2).
 
-### 3.5 System Prompt
+### 4.5 System Prompt
 
 ```ts
 // context-builder/prompt.ts
 export const CONTEXT_BUILDER_SYSTEM_PROMPT = `You are a context builder for an AI agent operating in delegation-only mode.
 
-You have read-only tools: Read, Glob, Grep, Ls. Use them to explore the workspace
+You have read-only tools: read, grep, find, ls. Use them to explore the workspace
 and gather context the main agent needs to effectively delegate work.
 
 ## What to gather
-- File contents directly relevant to the prompt (use Read)
-- Directory structure if the prompt involves code navigation (use Ls, Glob)
-- Memory/context files if the prompt references past work (use Read)
-- Config or schema files if the prompt involves system configuration (use Read)
-- Search for relevant patterns (use Grep)
+- File contents directly relevant to the prompt (use read)
+- Directory structure if the prompt involves code navigation (use ls, find)
+- Memory/context files if the prompt references past work (use read)
+- Config or schema files if the prompt involves system configuration (use read)
+- Search for relevant patterns (use grep)
 
 ## Rules
 1. Be conservative — only include what's clearly relevant
@@ -394,19 +513,23 @@ and gather context the main agent needs to effectively delegate work.
 Return markdown with relevant context, or the single word EMPTY if no context is needed.`;
 ```
 
-### 3.6 Sub-Agent Spawn Details
+### 4.6 Recursion Safety
 
-The context builder is spawned via **`pi.exec()`** (an extension-side API) which shells out to `subpi` or `pi` directly. `pi.exec()` is **not** an LLM tool — it is only callable from extension code. Key aspects:
-
-1. **Read-only tool set** — the spawn restricts tools to `Read`, `Glob`, `Grep`, `Ls`. The builder cannot write, execute, or modify anything.
-2. **Timeout control** — `Promise.race` wraps the spawn; if it exceeds `timeoutMs`, we fall back to stale cache.
-3. **Model selection** — the spawn specifies the configured model (default: Sonnet) for fast context gathering.
-4. **Cleanup** — the sub-agent process terminates when it completes; no manual cleanup required.
-5. **Recursion safety** — the context builder runs as a sub-agent (with `SUBPI_SESSION_NAME` set), so the `isMainAgent()` guard in our hooks prevents it from being restricted.
+The context builder runs as a sub-process (separate `pi` invocation). This means:
+1. It loads its own extension instances independently
+2. The `PI_SUBAGENT=1` env var is set, so `isMainAgent()` returns false
+3. Even if Reins is loaded in the sub-process, the tool_call hook won't restrict it
+4. There is no risk of infinite recursion — the sub-process is a flat invocation, not a re-entrant hook
 
 ---
 
-## 4. Tool Allowlist
+## 5. Tool Allowlist
+
+### Pi Built-in Tools (Reference)
+
+Pi's built-in LLM-callable tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+
+There are **no** built-in tools named `subagents`, `sessions_spawn`, `message`, `tts`, `web_search`, `web_fetch`, `browser`, or `image`. Those are either OpenClaw concepts or third-party extension tools.
 
 ### Canonical Allowed Tools (delegation-only mode)
 
@@ -416,58 +539,75 @@ The context builder is spawned via **`pi.exec()`** (an extension-side API) which
 
 | Tool | Reason |
 |------|--------|
-| `reins_delegate` | Extension-provided delegation tool — spawns sub-agents via `pi.exec()` under the hood |
-
-> **Why not `subagents` / `sessions_spawn`?** Pi has no built-in delegation tools. Its built-in tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Delegation must be provided by the extension itself (via `pi.registerTool()`) or by another extension. Reins registers `reins_delegate` which uses `pi.exec()` (extension-side) to spawn `pi` or `subpi` sub-processes.
->
-> **Note on `pi.exec()`:** This is an extension-side API — the LLM agent cannot call it directly. Only the extension code uses it internally.
+| `reins_delegate` | Extension-provided delegation tool — registered by Reins via `pi.registerTool()`. Spawns sub-agents via `pi.exec()` internally. |
 
 ### Blocked (everything else)
 
-All other tools are blocked at the `tool_call` level. Key blocked tools:
+All other tools — both built-in and extension-provided — are blocked at the `tool_call` level:
 
 | Tool | Why blocked |
 |------|------------|
-| `exec` | Shell execution — must be delegated |
-| `Read` / `Write` / `Edit` | File operations — must be delegated |
-| `web_search` / `web_fetch` | Research — must be delegated |
-| `browser` | Browser automation — must be delegated |
-| `image` | Image analysis — must be delegated |
+| `bash` | Shell execution — must be delegated |
+| `read` | File reading — must be delegated |
+| `write` | File writing — must be delegated |
+| `edit` | File editing — must be delegated |
+| `grep` | Search — must be delegated |
+| `find` | File discovery — must be delegated |
+| `ls` | Directory listing — must be delegated |
+| Any extension tool | Third-party tools — must be delegated |
+
+### Runtime Tool Discovery
+
+The allowlist is checked against `event.toolName` at runtime. To see what tools are currently registered (built-in + extensions), use:
+
+```ts
+const allTools = pi.getAllTools();    // [{ name, description, parameters }]
+const activeTools = pi.getActiveTools(); // ["read", "bash", "edit", ...]
+```
 
 ### Configurable Override
 
-The allowlist is configurable via `~/.pi/agent/settings.json` under `reins.allowedTools`.
+The allowlist is configurable via settings under `reins.allowedTools`. This allows users to permit specific tools in delegation mode (e.g., allowing `read` for quick lookups without full delegation).
 
 ---
 
-## 5. Config Schema
+## 6. Config Schema
 
-Configuration in `~/.pi/agent/settings.json`:
+### Two-Scope Model
 
 ```jsonc
+// ~/.pi/agent/settings.json (GLOBAL — base defaults)
 {
-  // Pi-level extension registration
   "extensions": ["~/.pi/agent/extensions/reins/index.ts"],
-
-  // Reins configuration (read by the extension at runtime)
   "reins": {
-    "enabled": false,         // Master toggle. Default: false.
-    "model": "sonnet",        // Context builder model. Default: "sonnet".
-    "timeoutMs": 12000,       // Context builder timeout in ms. Default: 12000.
-    "allowedTools": [         // Tools allowed in delegation mode.
-      "reins_delegate"        // Default: ["reins_delegate"]
-    ],
-    "cacheMaxAge": 300000,    // Cache TTL in ms (5 min). Default: 300000.
-    "debug": false            // Log context builder input/output. Default: false.
+    "enabled": false,                        // Master toggle. Default: false.
+    "model": "claude-sonnet-4-20250514",     // Context builder model. Concrete provider/model ID.
+    "timeoutMs": 12000,                      // Context builder timeout in ms. Default: 12000.
+    "allowedTools": ["reins_delegate"],       // Tools allowed in delegation mode.
+    "cacheMaxAge": 300000,                   // Cache TTL in ms (5 min). Default: 300000.
+    "debug": false                           // Log context builder input/output. Default: false.
   }
 }
 ```
+
+```jsonc
+// .pi/settings.json (PROJECT — overrides global for this project)
+{
+  "reins": {
+    "enabled": true,                         // Override: always-on for this project
+    "model": "claude-haiku-4-20250414",      // Faster model for this project
+    "allowedTools": ["reins_delegate", "read"]  // Also allow direct reads
+  }
+}
+```
+
+**Precedence:** Project settings override global settings per-key. Unspecified project keys fall through to global. Unspecified global keys use hardcoded defaults.
 
 ### Config Resolution
 
 ```ts
 // config.ts
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { ALLOWED_TOOLS, DEFAULT_TIMEOUT_MS, DEFAULT_CACHE_MAX_AGE } from "./constants.js";
@@ -481,44 +621,75 @@ export type ReinsConfig = {
   debug: boolean;
 };
 
-const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+const PROJECT_SETTINGS_FILE = "settings.json";
 
-let cachedSettings: Record<string, unknown> | null = null;
-let cachedMtime = 0;
+let cachedGlobal: Record<string, unknown> | null = null;
+let cachedGlobalMtime = 0;
 
-function readSettings(): Record<string, unknown> {
-  // Re-read settings if file has changed (stat-based cache)
+function readJsonFile(path: string): Record<string, unknown> {
   try {
-    const { mtimeMs } = require("node:fs").statSync(SETTINGS_PATH);
-    if (cachedSettings && mtimeMs === cachedMtime) return cachedSettings;
-    cachedSettings = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
-    cachedMtime = mtimeMs;
-    return cachedSettings!;
+    return JSON.parse(readFileSync(path, "utf-8"));
   } catch {
     return {};
   }
 }
 
-export function getReinsConfig(): ReinsConfig {
-  const settings = readSettings();
-  const rc = (settings.reins ?? {}) as Record<string, unknown>;
+function readGlobalSettings(): Record<string, unknown> {
+  try {
+    const { mtimeMs } = statSync(GLOBAL_SETTINGS_PATH);
+    if (cachedGlobal && mtimeMs === cachedGlobalMtime) return cachedGlobal;
+    cachedGlobal = readJsonFile(GLOBAL_SETTINGS_PATH);
+    cachedGlobalMtime = mtimeMs;
+    return cachedGlobal!;
+  } catch {
+    return {};
+  }
+}
+
+function readProjectSettings(cwd: string): Record<string, unknown> {
+  return readJsonFile(join(cwd, ".pi", PROJECT_SETTINGS_FILE));
+}
+
+export function getReinsConfig(cwd?: string): ReinsConfig {
+  const globalSettings = readGlobalSettings();
+  const projectSettings = cwd ? readProjectSettings(cwd) : {};
+
+  const globalRc = (globalSettings.reins ?? {}) as Record<string, unknown>;
+  const projectRc = (projectSettings.reins ?? {}) as Record<string, unknown>;
+
+  // Project overrides global per-key
+  const merged = { ...globalRc, ...projectRc };
 
   return {
-    enabled: typeof rc.enabled === "boolean" ? rc.enabled : false,
-    model: typeof rc.model === "string" ? rc.model : "sonnet",
-    timeoutMs: typeof rc.timeoutMs === "number" ? rc.timeoutMs : DEFAULT_TIMEOUT_MS,
-    allowedTools: Array.isArray(rc.allowedTools) ? rc.allowedTools : ALLOWED_TOOLS,
-    cacheMaxAge: typeof rc.cacheMaxAge === "number" ? rc.cacheMaxAge : DEFAULT_CACHE_MAX_AGE,
-    debug: typeof rc.debug === "boolean" ? rc.debug : false,
+    enabled: typeof merged.enabled === "boolean" ? merged.enabled : false,
+    model: typeof merged.model === "string" ? merged.model : "claude-sonnet-4-20250514",
+    timeoutMs: typeof merged.timeoutMs === "number" ? merged.timeoutMs : DEFAULT_TIMEOUT_MS,
+    allowedTools: Array.isArray(merged.allowedTools) ? merged.allowedTools : ALLOWED_TOOLS,
+    cacheMaxAge: typeof merged.cacheMaxAge === "number" ? merged.cacheMaxAge : DEFAULT_CACHE_MAX_AGE,
+    debug: typeof merged.debug === "boolean" ? merged.debug : false,
   };
+}
+
+/**
+ * Write reins.enabled to global settings.
+ * Reads current file, updates reins.enabled, writes back atomically.
+ */
+export async function setReinsEnabled(enabled: boolean): Promise<void> {
+  const settings = readJsonFile(GLOBAL_SETTINGS_PATH) as Record<string, any>;
+  if (!settings.reins) settings.reins = {};
+  settings.reins.enabled = enabled;
+  writeFileSync(GLOBAL_SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+  // Invalidate cache
+  cachedGlobal = null;
 }
 ```
 
 ---
 
-## 6. Command Handlers
+## 7. Command Handlers
 
-### 6.1 `/reins on|off|status`
+### 7.1 `/reins on|off|status`
 
 ```ts
 // commands/reins.ts
@@ -533,34 +704,67 @@ export function registerReinsCommand(pi: ExtensionAPI) {
 
       if (arg === "on") {
         await setReinsEnabled(true);
-        ctx.ui.notify("🫸 Reins **on** — agent is now delegation-only.", "info");
+
+        // Check if first-time onboarding needed (file-based persistence)
+        if (shouldShowOnboarding()) {
+          ctx.ui.notify(
+            "🔒 Reins enabled. Agent is delegation-only.\n\n" +
+            "First time? Here's what changed:\n" +
+            "  • Your agent can only delegate — no direct tool use\n" +
+            "  • A context builder runs once per prompt (invisible to you)\n" +
+            "  • /reins off to disable, /reins status for details",
+            "info",
+          );
+          markOnboardingShown();
+        } else {
+          ctx.ui.notify("🔒 Reins enabled. Agent is delegation-only.", "info");
+        }
         return;
       }
 
       if (arg === "off") {
         await setReinsEnabled(false);
-        ctx.ui.notify("🔓 Reins **off** — agent has full tool access.", "info");
+        ctx.ui.notify("🔓 Reins disabled. Agent has full tool access.", "info");
         return;
       }
 
       if (arg === "status" || arg === "") {
-        const config = getReinsConfig();
+        const config = getReinsConfig(ctx.cwd);
         const msg = config.enabled
-          ? `🫸 Reins is **on** (context builder: ${config.model})`
-          : "🔓 Reins is **off**";
+          ? `🔒 Reins: enabled (model: ${config.model})`
+          : "🔓 Reins: disabled";
         ctx.ui.notify(msg, "info");
         return;
       }
 
-      ctx.ui.notify("Usage: `/reins on|off|status`", "warn");
+      ctx.ui.notify("Usage: /reins on|off|status", "warning");
     },
   });
 }
 ```
 
-**`setReinsEnabled` implementation:** Reads `~/.pi/agent/settings.json`, sets `reins.enabled`, writes back atomically.
+### Onboarding Persistence
 
-### 6.2 `/prework <prompt>`
+The "has seen onboarding" flag must survive across sessions and projects. `pi.appendEntry()` writes to session state only — it does not persist across sessions. Instead, use file I/O:
+
+```ts
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const ONBOARDING_FLAG = join(homedir(), ".pi", "agent", "reins-onboarding-shown");
+
+function shouldShowOnboarding(): boolean {
+  return !existsSync(ONBOARDING_FLAG);
+}
+
+function markOnboardingShown(): void {
+  mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
+  writeFileSync(ONBOARDING_FLAG, new Date().toISOString(), "utf-8");
+}
+```
+
+### 7.2 `/prework <prompt>`
 
 Explicitly triggers the context builder without enabling the always-on harness.
 
@@ -576,11 +780,11 @@ export function registerPreworkCommand(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const prompt = (args ?? "").trim();
       if (!prompt) {
-        ctx.ui.notify("Usage: `/prework <what you're about to work on>`", "warn");
+        ctx.ui.notify("Usage: /prework <what you're about to work on>", "warning");
         return;
       }
 
-      const config = getReinsConfig();
+      const config = getReinsConfig(ctx.cwd);
       try {
         const result = await buildContextWithTimeout({
           prompt,
@@ -595,11 +799,16 @@ export function registerPreworkCommand(pi: ExtensionAPI) {
         }
 
         const marker = result.partial ? " *(partial — timed out)*" : "";
-        // Use sendMessage to inject the context into the conversation
-        pi.sendMessage({
-          type: "text",
-          text: `📋 **Pre-gathered context**${marker}:\n\n${result.context}`,
-        });
+
+        // Inject as a custom message — appears in session, sent to LLM on next turn
+        pi.sendMessage(
+          {
+            customType: "reins_prework",
+            content: `📋 **Pre-gathered context**${marker}:\n\n${result.context}`,
+            display: true,
+          },
+          { deliverAs: "nextTurn" },
+        );
       } catch {
         ctx.ui.notify("⚠️ Context builder failed.", "error");
       }
@@ -610,16 +819,23 @@ export function registerPreworkCommand(pi: ExtensionAPI) {
 
 ---
 
-## 7. State Management
+## 8. State Management
 
-### 7.1 Enabled State
+### 8.1 Enabled State
 
-- **Persisted in:** `~/.pi/agent/settings.json` at `reins.enabled`
-- **Written by:** `/reins on|off` command handler
+- **Persisted in:** `~/.pi/agent/settings.json` at `reins.enabled` (global scope), overridable by `.pi/settings.json` (project scope)
+- **Written by:** `/reins on|off` command handler (writes to global scope)
 - **Read by:** Both hooks on every invocation (stat-cached to avoid redundant disk reads)
 - **Survives restarts:** Yes — it's in the settings file
 
-### 7.2 Context Cache
+### 8.2 Onboarding State
+
+- **Persisted in:** `~/.pi/agent/reins-onboarding-shown` (dedicated file)
+- **NOT** `pi.appendEntry()` — that's session-scoped, not persistent across sessions
+- **Written once:** on first `/reins on`
+- **Read by:** `/reins on` command handler
+
+### 8.3 Context Cache
 
 In-memory cache, keyed by `promptHash`. Not persisted across Pi restarts.
 
@@ -670,29 +886,30 @@ export const contextCache = new ContextCache();
 
 ---
 
-## 8. Extension Points
+## 9. Extension Points
 
-### 8.1 Composability
+### 9.1 Composability
 
 Pi extensions compose naturally:
 
-- Multiple extensions can subscribe to `before_agent_start` — Pi concatenates system prompt injections
+- Multiple extensions can subscribe to `before_agent_start` — Pi chains `systemPrompt` modifications
 - Multiple extensions can subscribe to `tool_call` — any extension returning `{ block: true }` prevents the call
-- The context builder model is configurable — can use a local model, a different provider, etc.
+- The context builder model is configurable — can use any model with a concrete provider/model ID
 
-### 8.2 Future Commands
+### 9.2 Future Commands
 
 - `/reins config <key> <value>` — runtime config changes
 - `/reins allow <tool>` — temporarily allow a tool
 - `/reins log` — show what context was injected on the last turn
+- `/reins on --project` — write enabled state to project-scoped settings
 
-### 8.3 Versioning & Migration
+### 9.3 Versioning & Migration
 
 v0.1.0 is the initial release. Config keys are additive — new keys get defaults, removed keys are ignored.
 
 ---
 
-## 9. Architecture Decision Records
+## 10. Architecture Decision Records
 
 ### ADR-001: Pi Extension Only
 
@@ -707,57 +924,53 @@ v0.1.0 is the initial release. Config keys are additive — new keys get default
 - Reins constrains the **coding agent's** tool usage. Pi is the coding agent; OpenClaw is the gateway layer above it. Constraining at the agent level is architecturally correct.
 - Pi's event model (`tool_call`, `before_agent_start`) maps directly to what Reins needs. No translation layer required.
 - Keeps the extension portable — works in any Pi environment, not just those running OpenClaw.
-- Simpler deployment — drop a `.ts` file in the extensions directory, no manifest file needed.
+- Simpler deployment — drop a `.ts` file in the extensions directory.
 
 **Consequences:**
 - No access to OpenClaw-specific features (HTTP routes, channel registration, gateway lifecycle hooks). These are not needed for Reins.
-- If OpenClaw adds native tool policy enforcement (e.g., `toolPolicy` in hook results), a future version could optionally integrate, but v1 does not depend on it.
 
 ### ADR-002: Main Agent Identification
 
 **Status:** Accepted
 **Date:** 2026-03-03
 
-**Context:** Reins must restrict only the main (top-level) agent, not sub-agents. Pi's `ExtensionContext` does **not** expose `parentSessionId`, `depth`, or any structural field to distinguish main from sub-agent.
+**Context:** Reins must restrict only the main (top-level) agent, not sub-agents. Pi's `ExtensionContext` does **not** expose `depth`, `parentSessionId`, `parentId`, or any structural field to distinguish main from sub-agent.
 
-**Decision:** Use an environment variable heuristic: `!process.env.SUBPI_SESSION_NAME`. Sub-agents spawned via `subpi` have this env var set; the main (top-level) agent does not.
+**Decision:** Use environment variable heuristics. The `reins_delegate` tool sets `PI_SUBAGENT=1` when spawning sub-processes. The `isMainAgent()` function checks for the absence of known sub-agent env vars (`SUBPI_SESSION_NAME`, `PI_SUBAGENT`).
 
-**Rationale:** This is the most reliable heuristic available in the current Pi ecosystem. `ExtensionContext` has no recursion depth or parent session fields. The env var approach is consistent with how `subpi` manages sub-agent lifecycle.
+**Alternative considered:** Apply restrictions universally. Since `reins_delegate` spawns sub-agents as separate `pi` processes, they load fresh extension instances. If the sub-agent's settings don't enable Reins, restrictions naturally don't apply. This works but is less explicit.
 
-**Consequences:** Depends on `subpi` setting `SUBPI_SESSION_NAME`. If sub-agents are spawned via a different mechanism that doesn't set this var, they would be incorrectly treated as main agents. Mitigation: document the requirement, and add the `__reins_building_context` recursion guard as a secondary safety net.
+**Rationale:** The env var approach is explicit and debuggable. It's consistent with how the `subagent` example extension manages sub-agent lifecycle.
 
-### ADR-003: subpi Is a CLI Tool, Not a Pi API
+**Consequences:** Depends on the delegation tool setting the env var. If sub-agents are spawned via a different mechanism, they need to set a recognized env var.
+
+### ADR-003: Extension-Provided Delegation Tool
 
 **Status:** Accepted
 **Date:** 2026-03-03
 
-**Context:** `subpi` is referenced throughout as the mechanism for spawning sub-agents. It could be confused with a Pi extension API.
+**Context:** Pi has no built-in delegation tool. Its built-in LLM-callable tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. The cuffed agent needs a way to spawn sub-agents.
 
-**Decision:** Document clearly: `subpi` is a CLI tool on PATH (provided by the OpenClaw environment). Pi extensions invoke it via `pi.exec()`. It is not part of `@mariozechner/pi-coding-agent`.
+**Decision:** Reins registers a `reins_delegate` tool via `pi.registerTool()`. This tool's `execute()` function uses `pi.exec()` (extension-side API) to spawn `pi` sub-processes.
 
-**Consequences:** The context builder spawn requires shelling out via `pi.exec()` rather than calling a typed API. Error handling must account for process-level failures.
+**Alternative considered:** Depend on the `subagent` example extension being installed. Rejected because: (a) it's an example, not a guaranteed dependency; (b) Reins should be self-contained.
 
----
+**Rationale:** Self-contained is better for a v1. Users install one extension and everything works. No dependency on external extensions or CLI tools.
 
-## 10. Migration Checklist: OpenClaw Plugin → Pi Extension
+**Consequences:** Reins bundles its own delegation logic. The `reins_delegate` tool is simpler than the full `subagent` extension (single mode only in v1, no parallel/chain), but can be extended later.
 
-For anyone porting an OpenClaw plugin to a Pi extension:
+### ADR-004: File-Based Onboarding Persistence
 
-| # | OpenClaw Plugin | Pi Extension | Notes |
-|---|----------------|--------------|-------|
-| 1 | `openclaw.plugin.json` manifest | No manifest — use file convention or `package.json` `"pi"` key | Delete the manifest file |
-| 2 | `import { OpenClawPluginApi } from "openclaw/plugin-sdk"` | `import { ExtensionAPI } from "@mariozechner/pi-coding-agent"` | |
-| 3 | Object export: `{ id, register(api) }` | Function export: `export default function(pi)` | |
-| 4 | `api.on("before_tool_call", ...)` | `pi.on("tool_call", ...)` | Different event name |
-| 5 | `api.on("before_prompt_build", ...)` | `pi.on("before_agent_start", ...)` | Different event name |
-| 6 | Return `{ block: true, blockReason: "..." }` | Return `{ block: true, reason: "..." }` | Different field name |
-| 7 | Return `{ prependContext: "..." }` | Return `{ systemPrompt: "..." }` | Different injection mechanism |
-| 8 | `api.pluginConfig` | Read `~/.pi/agent/settings.json` directly | No built-in plugin config |
-| 9 | `api.registerCommand({ name, handler })` | `pi.registerCommand(name, { handler: async (args, ctx) => { ... } })` | Different registration shape |
-| 10 | `api.config.plugins.entries.<id>.enabled` | `settings.json` → `reins.enabled` | Different config location |
-| 11 | `~/.openclaw/extensions/` | `~/.pi/agent/extensions/` | Different directory |
-| 12 | `"openclaw": { "extensions": [...] }` in package.json | `"pi": { "extensions": [...] }` in package.json | Different key |
-| 13 | `api.subpi.spawn(...)` | `pi.exec("subpi", [...])` | subpi is a CLI, not an API |
+**Status:** Accepted
+**Date:** 2026-03-03
+
+**Context:** The "first `/reins on` ever" onboarding message should show once globally, not per-session.
+
+**Decision:** Persist the "onboarding shown" flag as a file at `~/.pi/agent/reins-onboarding-shown`.
+
+**Rejected alternative:** `pi.appendEntry("reins_onboarding", { shown: true })`. `appendEntry` writes session entries — they only exist within a single session and are not durable global state. Checking session entries on startup would only find the flag if it was set in the same session.
+
+**Rationale:** A simple file is the most reliable cross-session persistence mechanism available in the Pi extension API.
 
 ---
 
@@ -765,18 +978,13 @@ For anyone porting an OpenClaw plugin to a Pi extension:
 
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
-| **Context builder adds 5–12s latency per turn** | High — UX degradation | High | Timeout with stale cache fallback. `/prework` for explicit pre-build. Sonnet is fast. |
+| **Context builder adds 5–12s latency per turn** | High — UX degradation | High | Timeout with stale cache fallback. `/prework` for explicit pre-build. |
 | **LLM ignores soft enforcement and tries blocked tools** | Medium — wasted tokens | Medium | Hard enforcement via `tool_call` catches all attempts. Soft layer reduces frequency. |
-| **Sub-agents also restricted** | Critical — delegation breaks | Low (mitigated by design) | `isMainAgent()` guard ensures only main agent is restricted. |
+| **Sub-agents also restricted** | Critical — delegation breaks | Low (mitigated by design) | `isMainAgent()` guard + `PI_SUBAGENT` env var ensures only main agent is restricted. |
 | **Context builder injects irrelevant context** | Medium — misleading | Medium | Conservative builder prompt. Cache keyed by prompt hash. TTL. Debug mode. |
-| **Pi `before_agent_start` not awaited** | High — context injection fails | Low (assumed awaited) | **Validate with Pi source before v1.** |
-| **Main agent identification unreliable** | High — blocks sub-agents or misses main | Medium | ADR-002: implement based on confirmed Pi API. |
+| **Main agent identification unreliable** | High — blocks sub-agents or misses main | Low | ADR-002: env var is set explicitly by our delegation tool. |
 | **`pi.exec()` spawn overhead** | Medium — slower context building | Medium | Timeout + cache fallback. |
 | **Token cost of context injection** | Low — adds tokens per turn | High (by design) | Hard truncation at 4000 tokens. Cache reduces redundant builds. |
-
-### Risk: Recursive Hook Invocation
-
-If the context builder triggers `before_agent_start` again, the hook would recurse. **Mitigation:** The `isMainAgent()` guard prevents this — the context builder runs as a sub-agent. Additional safety: a `__reins_building_context` flag on the context object breaks any unexpected recursion.
 
 ---
 

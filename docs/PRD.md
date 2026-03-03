@@ -21,9 +21,9 @@ The root cause: agents have too many tools and no structural constraint on how t
 
 ## Goals
 
-- **G1:** Strip the main agent's tool access to delegate-only — hard block, not a suggestion. Reins provides its own delegation tool via the extension (using `pi.exec()` to spawn `pi` sub-processes), or relies on any extension-provided sub-agent tool already available.
-- **G2:** Run a context builder sub-agent once per user prompt (via `before_agent_start`) that injects relevant context as a prepended system prompt
-- **G3:** Toggleable via `/reins on|off|status` slash command, backed by persistent config
+- **G1:** Strip the main agent's tool access to delegate-only — hard block, not a suggestion. Reins registers its own delegation tool (`reins_delegate`) via `pi.registerTool()`, which internally spawns `pi` sub-processes using `pi.exec()` (an extension-side API, not LLM-callable).
+- **G2:** Run a context builder sub-agent once per user prompt (via `before_agent_start`) that injects relevant context as a modified system prompt
+- **G3:** Toggleable via `/reins on|off|status` slash command, backed by persistent config in settings files
 - **G4:** Default OFF — zero impact until activated
 - **G5:** Implemented as a Pi extension (`@mariozechner/pi-coding-agent`)
 
@@ -58,7 +58,13 @@ As a developer, I want to see what context was injected (or know that nothing wa
 _Deferred to v2._ In v1, context injection is invisible. v2 will add opt-in transparency (e.g. `/reins verbose on`).
 
 **US5 — Persistent toggle**
-As a developer, I want the harness enabled/disabled state to survive restarts (persisted via `~/.pi/agent/settings.json`) so I don't have to re-enable it every session. Note: mid-session state (context cache, tool block counts) is in-memory and resets on restart — this is by design.
+As a developer, I want the harness enabled/disabled state to survive restarts so I don't have to re-enable it every session.
+
+_Persistence model:_ Toggle state is stored in Pi's settings files using the two-scope model:
+- **Global:** `~/.pi/agent/settings.json` → applies to all projects
+- **Project:** `.pi/settings.json` → overrides global for this project
+
+The `/reins on|off` command writes to the **global** settings file by default. A future version may support `--project` scope. Mid-session state (context cache, tool block counts) is in-memory and resets on restart — this is by design.
 
 **US6 — Graceful failure**
 As a developer, if the context builder fails or times out, I want the main agent to proceed unblocked — Reins should never be the reason a turn fails.
@@ -66,6 +72,10 @@ As a developer, if the context builder fails or times out, I want the main agent
 ---
 
 ## Architecture Overview
+
+### Pi Built-in Tools (Reference)
+
+Pi's built-in LLM-callable tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. There are no built-in delegation, messaging, or TTS tools. Delegation must be provided by extensions — either the `subagent` example extension or a custom tool registered via `pi.registerTool()`.
 
 ### Components
 
@@ -83,7 +93,7 @@ User message
           │    - Reads prompt intent                       │
           │    - Searches files, memory, past turns        │
           │    - Returns: context block OR empty            │
-          │    - Model: Sonnet (default, user-configurable) │
+          │    - Model: claude-sonnet-4-20250514 (default)  │
           │    - Timeout: 10-15s (Promise.race)            │
           │    - On timeout: inject partial / stale cache   │
           │    - On failure: return void, proceed unblocked │
@@ -95,22 +105,23 @@ User message
           │      non-delegation calls at execution time    │
           │                                                │
           ▼                                                │
-   Prepend context to prompt ◄─────────────────────────────┘
+   Modified system prompt ◄────────────────────────────────┘
           │
           ▼
    [Main Agent — CUFFED]
-   Tools visible but blocked except: delegation tool(s) provided by the extension
+   Tools visible but blocked except: reins_delegate (registered by this extension)
    LLM sees full tool schema; non-delegation calls return:
      { block: true, reason: "Reins: restricted to delegation only" }
           │
           ▼
-   Delegates to executor sub-agent(s)
+   Delegates to executor sub-agent(s) via reins_delegate tool
 ```
 
 ### Toggle Mechanism
 
 ```jsonc
-// ~/.pi/agent/settings.json
+// ~/.pi/agent/settings.json (global scope)
+// .pi/settings.json (project scope — overrides global)
 {
   "extensions": ["~/.pi/agent/extensions/reins/index.ts"],
   "reins": {
@@ -128,8 +139,26 @@ Slash command handler (registered via `pi.registerCommand`):
 
 ```ts
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 
 export default function (pi: ExtensionAPI) {
+  // Register the delegation tool so the cuffed agent can spawn sub-agents.
+  // Pi has no built-in delegation tool — we must provide one.
+  pi.registerTool({
+    name: "reins_delegate",
+    label: "Delegate",
+    description: "Delegate a task to a sub-agent with full tool access",
+    parameters: Type.Object({
+      task: Type.String({ description: "Task description for the sub-agent" }),
+      model: Type.Optional(Type.String({ description: "Model ID override (e.g. claude-sonnet-4-20250514)" })),
+    }),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      // Spawns a pi sub-process via pi.exec() internally — see ARCH.md §3
+      // ...
+      return { content: [{ type: "text", text: "..." }] };
+    },
+  });
+
   // Soft enforcement: inject delegation-only system context
   // Note: before_agent_start fires once per user prompt, not per internal tool/LLM turn
   pi.on("before_agent_start", async (event, ctx) => {
@@ -140,7 +169,8 @@ export default function (pi: ExtensionAPI) {
 
     // 2. Inject delegation-only instruction + gathered context
     const parts = [
-      "You are in delegation-only mode (Reins). You MUST delegate all work to sub-agents. Do not use other tools directly.",
+      event.systemPrompt,
+      "You are in delegation-only mode (Reins). You MUST delegate all work to sub-agents via reins_delegate. Do not use other tools directly.",
     ];
     if (context) parts.push(context);
 
@@ -150,7 +180,7 @@ export default function (pi: ExtensionAPI) {
   // Hard enforcement: block non-delegation tool calls at execution time
   pi.on("tool_call", async (event, ctx) => {
     if (!isEnabled()) return;
-    const allowed = ["reins_delegate"]; // Extension-provided delegation tool(s)
+    const allowed = ["reins_delegate"]; // Extension-provided delegation tool
     if (!allowed.includes(event.toolName)) {
       return { block: true, reason: "Reins: restricted to delegation only" };
     }
@@ -160,7 +190,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("reins", {
     description: "Toggle delegation-only harness (on/off/status)",
     handler: async (args, ctx) => {
-      // ... toggle logic
+      // ... toggle logic — reads/writes ~/.pi/agent/settings.json
     },
   });
 
@@ -176,11 +206,11 @@ export default function (pi: ExtensionAPI) {
 
 ### Context Builder
 
-- Runs as a sub-process via `pi.exec()` with configurable timeout (default 10–15s, via `Promise.race`)
-- **Model:** Sonnet by default, user-configurable via `reins.contextModel` in `~/.pi/agent/settings.json`
-- Given: the user's raw prompt + recent conversation
+- Runs as a sub-process: the extension's `reins_delegate` tool or a dedicated builder function uses `pi.exec()` to spawn `pi` with `--mode json -p --no-session` flags
+- **Model:** `claude-sonnet-4-20250514` by default, user-configurable via `reins.model` in settings
+- Given: the user's raw prompt (from `event.prompt`)
 - Outputs: a structured context block, or nothing
-- Scope: codebase files, memory, docs, past conversations — builder decides what's relevant
+- Scope: codebase files, memory, docs — builder decides what's relevant
 
 **Failure handling:**
 - Extension implements its own timeout via `Promise.race` (no built-in timeout in Pi's event system)
@@ -191,9 +221,9 @@ export default function (pi: ExtensionAPI) {
 
 ### Tool Restriction (Dual-Layer Enforcement)
 
-There is no extension API to inject tool policies into the pipeline directly. `pi.setActiveTools()` can hide tools, but we want them visible-but-blocked so the LLM understands the constraint. The solution is dual-layer enforcement:
+`pi.setActiveTools()` can hide tools, but we want them visible-but-blocked so the LLM understands the constraint. The solution is dual-layer enforcement:
 
-1. **Soft layer — `before_agent_start`:** Injects system context telling the agent it's delegation-only. Reduces wasted attempts — the model knows not to try.
+1. **Soft layer — `before_agent_start`:** Modifies system prompt telling the agent it's delegation-only. Reduces wasted attempts — the model knows not to try.
 2. **Hard layer — `tool_call`:** Blocks non-delegation tool calls at execution time. Returns `{ block: true, reason: "Reins: restricted to delegation only" }`.
 
 Tools still appear in the LLM's schema but calls are blocked. The model sees them but can't use them. This is acceptable for v1 — the soft layer minimises noise, the hard layer guarantees enforcement.
@@ -206,11 +236,11 @@ All open questions have been resolved or dropped.
 
 | # | Question | Resolution |
 |---|----------|------------|
-| OQ1 | How do you hard-restrict tool access? | **Resolved.** Dual-layer enforcement: `tool_call` event blocks non-delegation calls (hard), `before_agent_start` injects delegation-only instruction (soft). `pi.setActiveTools()` exists but hides tools entirely — we want visible-but-blocked. |
-| OQ2 | Context builder model choice? | **Resolved.** Default to Sonnet, user-configurable via `reins.contextModel` in `~/.pi/agent/settings.json`. |
+| OQ1 | How do you hard-restrict tool access? | **Resolved.** Dual-layer enforcement: `tool_call` event blocks non-delegation calls (hard), `before_agent_start` modifies system prompt (soft). `pi.setActiveTools()` exists but hides tools entirely — we want visible-but-blocked. |
+| OQ2 | Context builder model choice? | **Resolved.** Default to `claude-sonnet-4-20250514`, user-configurable via `reins.model` in settings. |
 | OQ3 | Cost model / token budget cap? | **Dropped.** Not relevant for v1. |
 | OQ4 | Context builder failure modes? | **Resolved.** Extension implements own timeout (Promise.race, 10–15s). Partial results injected with caveat marker. On total failure, return void — agent proceeds. Cache pattern for stale fallback on subsequent turns. |
-| OQ5 | How does cuffed agent communicate delegation plan? | **Resolved.** The agent's natural language response describes what it's delegating and why — no special UX needed. The cuffed agent already explains its plan conversationally before spawning sub-agents. |
+| OQ5 | How does cuffed agent communicate delegation plan? | **Resolved.** The agent's natural language response describes what it's delegating and why — no special UX needed. |
 
 ---
 
@@ -230,11 +260,12 @@ All open questions have been resolved or dropped.
 
 ### v1 — Core Harness (Pi Extension)
 - [ ] Pi extension scaffold (`~/.pi/agent/extensions/reins/index.ts`)
-- [ ] `/reins` slash command (on/off/status) via `pi.registerCommand`
-- [ ] Config-backed toggle via `~/.pi/agent/settings.json`
-- [ ] `before_agent_start` event — context injection + soft tool restriction
+- [ ] `reins_delegate` tool registered via `pi.registerTool()` — spawns `pi` sub-processes via `pi.exec()`
+- [ ] `/reins` slash command (on/off/status) via `pi.registerCommand` with `handler` callback
+- [ ] Config-backed toggle via `~/.pi/agent/settings.json` (global) with `.pi/settings.json` (project) override
+- [ ] `before_agent_start` event — context injection + soft tool restriction (fires once per user prompt)
 - [ ] `tool_call` event — hard tool restriction (dual-layer enforcement)
-- [ ] Context builder sub-process via `pi.exec()` to spawn `pi` subprocess (Sonnet default, configurable model)
+- [ ] Context builder sub-process via `pi.exec()` to spawn `pi --mode json -p --no-session` (model: `claude-sonnet-4-20250514` default, configurable)
 - [ ] Context builder timeout + cache pattern
 - [ ] `/prework <prompt>` explicit trigger via `pi.registerCommand`
 
@@ -242,4 +273,5 @@ All open questions have been resolved or dropped.
 - [ ] Context builder tuning / scope configuration
 - [ ] Metrics + logging
 - [ ] Context injection transparency — opt-in visibility of injected context (US4)
+- [ ] `/reins on --project` for project-scoped toggle
 - [ ] Evaluate porting to OpenClaw plugin if demand exists

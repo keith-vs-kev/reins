@@ -17,15 +17,19 @@ Consistent language for contributors working on Reins as a **Pi extension**.
 | **ExtensionAPI** | The API object passed to the extension's default export function |
 | **Event** | A Pi lifecycle event subscribed via `pi.on(eventName, handler)` |
 | **Tool** | An LLM-callable function registered via `pi.registerTool()` |
-| **Command** | A `/slash` command registered via `pi.registerCommand()` |
+| **Command** | A `/slash` command registered via `pi.registerCommand(name, { handler })` |
 | **`tool_call` event** | Fires before tool execution; return `{ block: true, reason }` to prevent it |
 | **`tool_result` event** | Fires after tool execution; can modify the result |
-| **`before_agent_start` event** | Fires before the agent turn; used for prompt/context injection |
-| **Session entry** | Persistent extension state via `pi.appendEntry()` |
-| **Settings** | Pi config in `~/.pi/agent/settings.json` or project `.pi/` |
+| **`before_agent_start` event** | Fires once per user prompt before the agent loop; used for prompt/context injection |
+| **Settings** | Pi config in `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project). Project overrides global. |
+| **Built-in tools** | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` — the only LLM tools Pi provides out of the box |
+| **`pi.exec()`** | Extension-side API for running shell commands — NOT an LLM-callable tool |
 
 **Not used (these are OpenClaw concepts, not Pi):**
 `plugin`, `hook`, `gateway`, `OpenClawPluginApi`, `before_tool_call`, `before_prompt_build`, `blockReason`, `openclaw.plugin.json`, `api.registerHook()`.
+
+**Not Pi built-in (do not reference as available tools):**
+`subagents`, `sessions_spawn`, `message`, `tts`, `web_search`, `web_fetch`, `browser`, `image`.
 
 ---
 
@@ -51,7 +55,7 @@ That's it. One line. No explanation of what changed — the user ran the command
 
 ```
 Reins: enabled
-Context builder: sonnet (default)
+Context builder: claude-sonnet-4-20250514
 Last context build: 12s ago — success (1,247 tokens)
 Cache age: 12s
 Tool blocks this session: 0
@@ -61,7 +65,7 @@ Or with issues:
 
 ```
 Reins: enabled
-Context builder: sonnet (default)
+Context builder: claude-sonnet-4-20250514
 Last context build: 4m ago — partial (timeout, 483 tokens)
 Cache age: 4m 12s
 Tool blocks this session: 3
@@ -97,7 +101,7 @@ The only moment Reins surfaces visually is in the `/reins status` response and i
 
 ### What "invisible" means
 
-The context builder runs once per user prompt (via `before_agent_start`). The user **never sees**:
+The context builder runs once per user prompt (via `before_agent_start`, which fires once before the agent loop starts). The user **never sees**:
 
 - The context builder spawning
 - The injected context block
@@ -110,7 +114,7 @@ From the user's perspective, they send a message, the agent responds. The respon
 
 - **Slightly longer first-response time** — the context builder adds 2–15s of latency once per user prompt before the agent starts. This is the only observable side effect. No loading indicator is shown; the agent simply takes a beat longer to start responding.
 - **Better-informed responses** — the agent references files it wasn't explicitly pointed at, remembers context from previous sessions, surfaces relevant docs. This is the payoff.
-- **No injected content in chat history** — the prepended context is part of the prompt assembly, not a visible message. It does not appear in the conversation thread. It's equivalent to system context — present in the LLM call, absent from the chat UI.
+- **No injected content in chat history** — the context is injected via system prompt modification (returned as `systemPrompt` from `before_agent_start`), not as a visible message. It does not appear in the conversation thread.
 
 ### Transparency (v2)
 
@@ -122,13 +126,13 @@ US4 in the PRD requests optional transparency — seeing what was injected. **Th
 
 ### Context builder timeout
 
-The user sees **nothing different**. The agent responds normally, possibly with less context than usual. If partial results were gathered before timeout, those are injected silently.
+The user sees **nothing different**. The agent responds normally, possibly with less context than usual. If partial results were gathered before timeout, those are injected silently via the system prompt.
 
 Internally, the extension logs the timeout. The user is not notified unless they check `/reins status`, which could show:
 
 ```
 Reins: enabled
-Context builder: sonnet (default)
+Context builder: claude-sonnet-4-20250514
 Last context build: timed out (partial context injected)
 ```
 
@@ -144,13 +148,13 @@ When the cuffed agent attempts a non-delegation tool call (shouldn't happen ofte
 
 The agent receives `{ block: true, reason: "Reins: restricted to delegation only" }` and re-routes to delegation. The user sees the agent delegate the task — they don't see the blocked attempt. This is internal plumbing.
 
-**Implementation detail:** The `tool_call` event handler returns `{ block: true, reason: "..." }` for any tool not on the allow-list. Pi surfaces the `reason` string to the model so it can self-correct.
+**Implementation detail:** The `tool_call` event handler returns `{ block: true, reason: "..." }` (typed as `ToolCallEventResult`) for any tool not on the allow-list. Pi surfaces the `reason` string to the model so it can self-correct.
 
 ### Tool-block circuit breaker
 
 If the agent gets stuck in a block loop, Reins escalates automatically:
 
-- **3 consecutive blocked tool calls in a single turn** — Reins injects a stronger delegation prompt into the current turn: _"You cannot use tools directly. Delegate this task to a sub-agent using `reins_delegate`."_ The user sees nothing; the agent course-corrects silently.
+- **3 consecutive blocked tool calls in a single turn** — Reins injects a stronger delegation prompt: _"You cannot use tools directly. Delegate this task to a sub-agent using `reins_delegate`."_ This is injected via `pi.sendMessage()` with `{ deliverAs: "steer" }` to interrupt the current turn. The user sees nothing; the agent course-corrects silently.
 - **5 consecutive blocked tool calls in a single turn** — Reins surfaces a warning to the user via `ctx.ui.notify`:
 
 ```
@@ -158,7 +162,7 @@ If the agent gets stuck in a block loop, Reins escalates automatically:
 Check delegation prompt or run `/reins off` to debug.
 ```
 
-The agent's turn continues — Reins doesn't kill it — but the user now has signal that something is stuck. The block counter resets at the start of each new turn.
+The agent's turn continues — Reins doesn't kill it — but the user now has signal that something is stuck. The block counter resets at the start of each new turn (tracked via `turn_start` event).
 
 ---
 
@@ -175,19 +179,23 @@ First time? Here's what changed:
   • /reins off to disable, /reins status for details
 ```
 
-The three-bullet explainer appears **once** — first activation only. Subsequent `/reins on` shows the single-line confirmation. The "has seen onboarding" flag is persisted via `pi.appendEntry("reins_onboarding", { shown: true })`.
+The three-bullet explainer appears **once** — first activation only. Subsequent `/reins on` shows the single-line confirmation.
+
+**Persistence:** The "has seen onboarding" flag is stored as a file at `~/.pi/agent/reins-onboarding-shown` (not via `pi.appendEntry()`, which is session-scoped and would not persist across sessions). See ARCH.md ADR-004.
 
 ### Setup required
 
 None. The extension ships with sensible defaults:
 
-- Context builder model: Sonnet
-- Timeout: 10s
-- Allowed tools: `reins_delegate` only (extension-provided delegation tool)
+- Context builder model: `claude-sonnet-4-20250514`
+- Timeout: 12s
+- Allowed tools: `reins_delegate` only (registered by the extension via `pi.registerTool()`)
 
-No config file to edit. No API keys to set. `/reins on` and go.
+No config file to edit. No API keys to set (uses the same API key Pi is already configured with). `/reins on` and go.
 
-Advanced users can configure via `~/.pi/agent/settings.json` — but that's a docs concern, not an onboarding flow.
+Advanced users can configure via settings files:
+- `~/.pi/agent/settings.json` for global defaults
+- `.pi/settings.json` for project-specific overrides (project takes precedence)
 
 ---
 
@@ -205,7 +213,7 @@ User: /prework refactor the auth middleware to use the new token service
 Agent: Context built (1,847 tokens, 3.1s). Ready — send your prompt.
 ```
 
-The prework response is **one line**: confirmation with token count and time. No dump of what was gathered — the context is injected into the next turn's prompt silently, same as the always-on mode.
+The prework response is **one line**: confirmation with token count and time. No dump of what was gathered — the context is injected into the next turn's prompt silently (delivered via `pi.sendMessage()` with `{ deliverAs: "nextTurn" }`).
 
 ### `/prework` (no argument)
 
@@ -217,7 +225,7 @@ Builds context for your next message. Does not enable Reins.
 ### Behaviour
 
 - Prework does **not** enable Reins. The agent retains full tool access.
-- The gathered context is injected into the **next turn only** — it's not persistent. Internally, `/prework` stores the built context in the session cache with a `prework` flag. The next `before_agent_start` event handler detects this flag, injects the context into the system prompt, and clears both the flag and the cached content. One shot — no residue.
+- The gathered context is injected into the **next turn only** — it's not persistent. Internally, `/prework` sends a custom message via `pi.sendMessage()` with `{ deliverAs: "nextTurn" }`, which queues it for the next user prompt. One shot — no residue.
 - If Reins is already enabled, `/prework` still works but is redundant (context builder runs automatically). Show:
 
 ```
