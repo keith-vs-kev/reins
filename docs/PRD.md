@@ -34,6 +34,7 @@ The root cause: agents have too many tools and no structural constraint on how t
 - Not a replacement for good prompting — it's a structural complement
 - v1 does not include a UI or dashboard
 - **OpenClaw plugin support is explicitly out of scope for v1.** Reins targets Pi only. A future version may port to other platforms, but v1 requirements, hooks, config, and acceptance criteria are defined exclusively against the Pi extension API.
+- **Reins does not guarantee invisible failure of blocked tool calls.** Blocked calls surface as error results that the model sees and may reference. This is by design (teaching mode). See ARCH.md §13.
 
 ---
 
@@ -268,6 +269,8 @@ All open questions have been resolved or dropped.
 - [ ] Context builder sub-process via `pi.exec()` to spawn `pi --mode json -p --no-session` (model: `claude-sonnet-4-20250514` default, configurable)
 - [ ] Context builder timeout + cache pattern
 - [ ] `/prework <prompt>` explicit trigger via `pi.registerCommand`
+
+- [ ] Test matrix validation (see ARCH.md §17 for full test matrix)
 
 ### v2 — Refinement
 - [ ] Context builder tuning / scope configuration

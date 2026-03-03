@@ -146,9 +146,9 @@ No error toast. No warning banner. The agent doesn't announce "I couldn't build 
 
 When the cuffed agent attempts a non-delegation tool call (shouldn't happen often with the soft layer, but the hard layer catches it):
 
-The agent receives `{ block: true, reason: "Reins: restricted to delegation only" }` and re-routes to delegation. The user sees the agent delegate the task — they don't see the blocked attempt. This is internal plumbing.
+The agent receives `{ block: true, reason: "Reins: restricted to delegation only" }` and re-routes to delegation. The blocked attempt is typically internal — the user doesn't see it in the chat UI — but the model receives the block reason as an error result and may reference it in its response.
 
-**Implementation detail:** The `tool_call` event handler returns `{ block: true, reason: "..." }` (typed as `ToolCallEventResult`) for any tool not on the allow-list. Pi surfaces the `reason` string to the model so it can self-correct.
+**Implementation detail:** The `tool_call` event handler returns `{ block: true, reason: "..." }` (typed as `ToolCallEventResult`) for any tool not on the allow-list. Pi surfaces the `reason` string as an error result that the model sees. This means blocked tool calls are **not invisible** — they surface as error results that may influence the model's behavior. This is by design: it teaches the model to self-correct toward delegation.
 
 ### Tool-block circuit breaker
 
@@ -243,3 +243,28 @@ Agent: Context build failed (timeout). Your next message will proceed without pr
 ```
 
 One line. No drama. The user can retry or just proceed.
+
+---
+
+## 7. Non-Interactive Mode Behavior
+
+Reins is primarily designed for interactive Pi sessions, but must behave correctly in all modes:
+
+- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command is **not available** (commands require interactive or RPC mode). Users must configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. `ctx.ui.notify()` is a no-op — the circuit breaker warning (§4) will not surface, but tool blocking still enforces the constraint.
+- **RPC mode (`--mode rpc`):** `/reins` is available via the `prompt` RPC command. `ctx.ui.notify()` emits to the RPC client.
+
+---
+
+## 8. Status Telemetry
+
+The `/reins status` output (§1) reports specific runtime data. Source of truth for each field:
+
+| Field | What it shows | Where it comes from |
+|-------|--------------|-------------------|
+| `Reins: enabled/disabled` | Current toggle state | `reins.enabled` in settings file (persistent) |
+| `Context builder:` | Model used for context building | `reins.model` in settings file (persistent) |
+| `Last context build:` | Time since last build + outcome | In-memory timestamp + status from last `buildContextWithTimeout` call. Resets on Pi restart. |
+| `Cache age:` | Time since last successful cache write | In-memory, `Date.now() - cacheEntry.timestamp`. Resets on restart. |
+| `Tool blocks this session:` | Count of blocked tool calls | In-memory counter incremented in `tool_call` hook. Resets on restart (per-session by design). |
+
+Token estimates in the status output use a rough `chars / 4` heuristic — not precise, but directionally useful for the user.
