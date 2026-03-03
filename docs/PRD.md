@@ -21,8 +21,8 @@ The root cause: agents have too many tools and no structural constraint on how t
 
 ## Goals
 
-- **G1:** Strip the main agent's tool access to delegate-only (subpi/subagent) — hard block, not a suggestion
-- **G2:** Run a context builder sub-agent before each main agent turn that injects relevant context as a prepended message
+- **G1:** Strip the main agent's tool access to delegate-only — hard block, not a suggestion. Reins provides its own delegation tool via the extension (using `pi.exec()` to spawn `pi` sub-processes), or relies on any extension-provided sub-agent tool already available.
+- **G2:** Run a context builder sub-agent once per user prompt (via `before_agent_start`) that injects relevant context as a prepended system prompt
 - **G3:** Toggleable via `/reins on|off|status` slash command, backed by persistent config
 - **G4:** Default OFF — zero impact until activated
 - **G5:** Implemented as a Pi extension (`@mariozechner/pi-coding-agent`)
@@ -52,8 +52,10 @@ _Acceptance criteria:_
 **US3 — Explicit prework**
 As a developer, I want to run `/prework <my prompt>` to manually trigger context building for a specific task, without enabling the always-on harness.
 
-**US4 — Transparent injection**
+**US4 — Transparent injection (v2)**
 As a developer, I want to see what context was injected (or know that nothing was injected) so I can debug and tune the context builder over time.
+
+_Deferred to v2._ In v1, context injection is invisible. v2 will add opt-in transparency (e.g. `/reins verbose on`).
 
 **US5 — Persistent toggle**
 As a developer, I want the harness enabled/disabled state to survive restarts (persisted via `~/.pi/agent/settings.json`) so I don't have to re-enable it every session. Note: mid-session state (context cache, tool block counts) is in-memory and resets on restart — this is by design.
@@ -97,7 +99,7 @@ User message
           │
           ▼
    [Main Agent — CUFFED]
-   Tools visible but blocked except: subagents, sessions_spawn, message, tts
+   Tools visible but blocked except: delegation tool(s) provided by the extension
    LLM sees full tool schema; non-delegation calls return:
      { block: true, reason: "Reins: restricted to delegation only" }
           │
@@ -129,6 +131,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
   // Soft enforcement: inject delegation-only system context
+  // Note: before_agent_start fires once per user prompt, not per internal tool/LLM turn
   pi.on("before_agent_start", async (event, ctx) => {
     if (!isEnabled()) return;
 
@@ -137,7 +140,7 @@ export default function (pi: ExtensionAPI) {
 
     // 2. Inject delegation-only instruction + gathered context
     const parts = [
-      "You are in delegation-only mode (Reins). You MUST delegate all work via subagents/sessions_spawn. Do not use other tools directly.",
+      "You are in delegation-only mode (Reins). You MUST delegate all work to sub-agents. Do not use other tools directly.",
     ];
     if (context) parts.push(context);
 
@@ -147,7 +150,7 @@ export default function (pi: ExtensionAPI) {
   // Hard enforcement: block non-delegation tool calls at execution time
   pi.on("tool_call", async (event, ctx) => {
     if (!isEnabled()) return;
-    const allowed = ["subagents", "sessions_spawn", "message", "tts"];
+    const allowed = ["reins_delegate"]; // Extension-provided delegation tool(s)
     if (!allowed.includes(event.toolName)) {
       return { block: true, reason: "Reins: restricted to delegation only" };
     }
@@ -156,7 +159,7 @@ export default function (pi: ExtensionAPI) {
   // Register /reins command
   pi.registerCommand("reins", {
     description: "Toggle delegation-only harness (on/off/status)",
-    async execute(args, ctx) {
+    handler: async (args, ctx) => {
       // ... toggle logic
     },
   });
@@ -164,7 +167,7 @@ export default function (pi: ExtensionAPI) {
   // Register /prework command
   pi.registerCommand("prework", {
     description: "Manually trigger context building for a prompt",
-    async execute(args, ctx) {
+    handler: async (args, ctx) => {
       // ... context builder logic
     },
   });
@@ -231,12 +234,12 @@ All open questions have been resolved or dropped.
 - [ ] Config-backed toggle via `~/.pi/agent/settings.json`
 - [ ] `before_agent_start` event — context injection + soft tool restriction
 - [ ] `tool_call` event — hard tool restriction (dual-layer enforcement)
-- [ ] Context builder sub-process via `pi.exec()` (Sonnet default, configurable model)
+- [ ] Context builder sub-process via `pi.exec()` to spawn `pi` subprocess (Sonnet default, configurable model)
 - [ ] Context builder timeout + cache pattern
 - [ ] `/prework <prompt>` explicit trigger via `pi.registerCommand`
 
 ### v2 — Refinement
 - [ ] Context builder tuning / scope configuration
 - [ ] Metrics + logging
-- [ ] Context injection transparency (user-visible summary via `ctx.ui.notify`)
+- [ ] Context injection transparency — opt-in visibility of injected context (US4)
 - [ ] Evaluate porting to OpenClaw plugin if demand exists

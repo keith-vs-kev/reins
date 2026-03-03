@@ -97,7 +97,7 @@ The only moment Reins surfaces visually is in the `/reins status` response and i
 
 ### What "invisible" means
 
-The context builder runs before each main agent turn. The user **never sees**:
+The context builder runs once per user prompt (via `before_agent_start`). The user **never sees**:
 
 - The context builder spawning
 - The injected context block
@@ -108,13 +108,13 @@ From the user's perspective, they send a message, the agent responds. The respon
 
 ### What the user actually experiences
 
-- **Slightly longer first-response time** — the context builder adds 2–15s of latency before the agent starts its turn. This is the only observable side effect. No loading indicator is shown; the agent simply takes a beat longer to start responding.
+- **Slightly longer first-response time** — the context builder adds 2–15s of latency once per user prompt before the agent starts. This is the only observable side effect. No loading indicator is shown; the agent simply takes a beat longer to start responding.
 - **Better-informed responses** — the agent references files it wasn't explicitly pointed at, remembers context from previous sessions, surfaces relevant docs. This is the payoff.
 - **No injected content in chat history** — the prepended context is part of the prompt assembly, not a visible message. It does not appear in the conversation thread. It's equivalent to system context — present in the LLM call, absent from the chat UI.
 
 ### Transparency (v2)
 
-US4 in the PRD calls for optional transparency — seeing what was injected. This is deferred to v2. When implemented, it should be opt-in (e.g. `/reins verbose on`) and render as a collapsed/summary block, not inline content.
+US4 in the PRD requests optional transparency — seeing what was injected. **This is deferred to v2 in both the PRD and UX spec.** When implemented, it should be opt-in (e.g. `/reins verbose on`) and render as a collapsed/summary block, not inline content.
 
 ---
 
@@ -150,7 +150,7 @@ The agent receives `{ block: true, reason: "Reins: restricted to delegation only
 
 If the agent gets stuck in a block loop, Reins escalates automatically:
 
-- **3 consecutive blocked tool calls in a single turn** — Reins injects a stronger delegation prompt into the current turn: _"You cannot use tools directly. Delegate this task to a sub-agent using `pi.exec()`."_ The user sees nothing; the agent course-corrects silently.
+- **3 consecutive blocked tool calls in a single turn** — Reins injects a stronger delegation prompt into the current turn: _"You cannot use tools directly. Delegate this task to a sub-agent using `reins_delegate`."_ The user sees nothing; the agent course-corrects silently.
 - **5 consecutive blocked tool calls in a single turn** — Reins surfaces a warning to the user via `ctx.ui.notify`:
 
 ```
@@ -171,7 +171,7 @@ The agent's turn continues — Reins doesn't kill it — but the user now has si
 
 First time? Here's what changed:
   • Your agent can only delegate — no direct tool use
-  • A context builder runs before each turn (invisible to you)
+  • A context builder runs once per prompt (invisible to you)
   • /reins off to disable, /reins status for details
 ```
 
@@ -183,7 +183,7 @@ None. The extension ships with sensible defaults:
 
 - Context builder model: Sonnet
 - Timeout: 10s
-- Allowed tools: delegation tools only (sub-agent spawning via `pi.exec()`)
+- Allowed tools: `reins_delegate` only (extension-provided delegation tool)
 
 No config file to edit. No API keys to set. `/reins on` and go.
 
