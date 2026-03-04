@@ -1,250 +1,246 @@
-# Reins Plan Validation Feedback (Against Actual PI Framework)
+# Reins Plan Validation (Against Actual Pi Framework)
 
 Date: 2026-03-04  
-Reviewer: Codex (validated against local `~/projects/pi-mono` + PI docs/source)
+Reviewer: Codex
 
-## Executive Verdict
+## Executive Summary
 
-The plan is directionally strong and mostly aligned with the real PI extension framework, but it has two implementation-critical inconsistencies that must be fixed before build-out:
+The plan is strong conceptually and mostly uses the right Pi extension primitives, but it has several implementation-critical mismatches with real framework behavior. The largest issues are non-interactive command UX assumptions, extension-load telemetry assumptions, context-builder input/history assumptions, and type-invalid code snippets in ARCH.
 
-1. **Context-builder process spawning is described two different ways, and one is not viable** (`pi.exec()` path cannot set child-only env vars).
-2. **Timeout + stale-cache behavior is specified but not actually implemented by the pseudocode flow shown.**
+Overall rating: **7.0/10**.
 
-Overall quality score: **7.5/10**.
+## Scope and Method
 
-## What Is Correct (Validated)
+Validated all planning docs in this repo:
+- `docs/PRD.md`
+- `docs/ARCH.md`
+- `docs/UX-SPEC.md`
 
-### Extension API and lifecycle usage
+Validated against actual source of truth in `~/projects/pi-mono`:
+- extension API types/runtime
+- command execution pipeline
+- tool wrapping/blocking semantics
+- settings manager and extension loader
+- print/json/rpc mode behavior
+- official `subagent` example extension
 
-The docs correctly use PI extension primitives:
+## What Is Correct
+
+### Core extension architecture is well aligned
+
+Correctly uses Pi extension surfaces:
 - `pi.registerTool()`
 - `pi.registerCommand()`
-- `pi.on("before_agent_start" | "tool_call" | "tool_result" | "turn_start" ... )`
-- `pi.sendMessage()` with `deliverAs`
-- `pi.getAllTools()` / `pi.getActiveTools()`
+- `pi.on("before_agent_start")`
+- `pi.on("tool_call")`
+- `pi.on("tool_result")`
+- `pi.sendMessage(..., { deliverAs })`
 
-Validation source:
-- `packages/coding-agent/src/core/extensions/types.ts`
-- `packages/coding-agent/docs/extensions.md`
+### Tool blocking mechanism is correctly specified
 
-### Tool-call hard block return shape
+`tool_call` returning `{ block: true, reason }` is correct and actually enforced by wrapper logic.
 
-Using:
+### before_agent_start chaining claims are correct
 
-```ts
-return { block: true, reason: "..." }
-```
+System prompt modifications from multiple extensions are chained in order.
 
-is correct for `tool_call` handlers (`ToolCallEventResult`).
+### Built-in tool inventory claims are correct
 
-Validation source:
-- `packages/coding-agent/src/core/extensions/types.ts`
-- `packages/coding-agent/src/core/extensions/wrapper.ts`
+The docs correctly identify:
+- default active tools: `read`, `bash`, `edit`, `write`
+- additional available tools: `grep`, `find`, `ls`
 
-### before_agent_start semantics
+### Two-scope settings model is correct
 
-The docs are correct that `before_agent_start` runs after user input and before the agent loop, and that system prompt modifications chain across handlers.
+Global/project settings paths and merge behavior are correctly described:
+- `~/.pi/agent/settings.json`
+- `.pi/settings.json`
+- project overrides global per key
 
-Validation source:
-- `packages/coding-agent/src/core/extensions/runner.ts`
-- `packages/coding-agent/docs/extensions.md`
+### `child_process.spawn()` choice is correct for env-tagged subprocesses
 
-### Built-in tool inventory claims
+Using `spawn()` to set child-only `REINS_SUBAGENT=1` aligns with real framework constraints.
 
-These claims are accurate:
-- Default active tools: `read`, `bash`, `edit`, `write`
-- Additional registry tools: `grep`, `find`, `ls`
+## Critical Mismatches (Must Fix)
 
-Validation source:
-- `packages/coding-agent/src/core/tools/index.ts`
+### 1) Non-interactive `/reins` UX is overstated
 
-### Extension discovery + package manifest
+Problem:
+- Docs state `/reins` executes in JSON/print mode and imply user-visible status/confirm text.
+- In print/json mode, `ctx.hasUI === false`, and `ctx.ui.notify()` is a no-op.
 
-`pi.extensions` in extension package manifest and extension discovery conventions are correctly represented.
+Impact:
+- Command handlers may run, but user-facing notify output is absent in print/json mode.
+- Planned UX behavior is not achievable as currently documented.
 
-Validation source:
-- `packages/coding-agent/src/core/extensions/loader.ts`
-- `packages/coding-agent/docs/extensions.md`
+Fix:
+- Document command execution and command visibility separately.
+- If output must appear in non-interactive modes, use a different path than `ui.notify` (e.g., explicit message injection strategy), and clearly define it.
 
-### Settings two-scope model
+### 2) `/reins status` “extension load order” relies on non-existent API
 
-Correctly stated:
-- Global: `~/.pi/agent/settings.json`
-- Project: `.pi/settings.json`
-- Project overrides global
+Problem:
+- UX spec suggests deriving load order via `pi.getAllExtensions()` (or equivalent).
+- `ExtensionAPI` does not expose extension-list APIs.
 
-Validation source:
-- `packages/coding-agent/docs/settings.md`
+Impact:
+- Spec requires telemetry that extension code cannot fetch directly through published API.
 
-### `/prework` next-turn injection mechanism
+Fix:
+- Remove this field from required status output, or move it behind framework change.
+- If needed, compute indirect diagnostics from known extension-owned state only.
 
-Using `pi.sendMessage(..., { deliverAs: "nextTurn" })` is real and aligns with runtime behavior.
+### 3) Context-builder input/history assumptions don’t match runtime flow
 
-Validation source:
-- `packages/coding-agent/src/core/extensions/types.ts`
-- `packages/coding-agent/src/core/agent-session.ts`
+Problem:
+- Docs repeatedly call builder input the “raw user prompt”.
+- In actual flow, `before_agent_start` receives prompt after skill/template expansion.
+- Builder subprocess is run with `--no-session`, so it has no session turn history.
 
-### Non-interactive command behavior
+Impact:
+- Expected relevance behavior may differ from documentation.
+- “search past turns/memory” expectations are overstated unless memory is file-based and discoverable via tools.
 
-The docs’ core claim that extension commands execute through the prompt pipeline in JSON/print/RPC modes is valid.
+Fix:
+- Update docs to say builder receives effective prompt post-expansion.
+- Clarify that session-message history is not available to subprocess with `--no-session`.
+- Reframe memory claims to file-based memory only (if present in workspace/agent files).
 
-Validation source:
-- `packages/coding-agent/src/core/agent-session.ts`
-- `packages/coding-agent/src/modes/print-mode.ts`
-- `packages/coding-agent/src/modes/rpc/rpc-mode.ts`
+### 4) Sub-agent “full tool access” claim is too broad
 
-## Critical Issues to Fix
+Problem:
+- Some sections imply sub-agents will have all built-ins (`read,bash,edit,write,grep,find,ls`).
+- Actual default active tool set is 4 tools unless `--tools` is explicitly set.
 
-### 1) Spawn strategy contradiction (`pi.exec()` vs `child_process.spawn()`)
+Impact:
+- Test matrix and expected behavior can fail due to incorrect default assumption.
 
-#### Current doc conflict
-- PRD says context builder can spawn via `pi.exec()`.
-- ARCH says `spawn()` is required to set `REINS_SUBAGENT=1` in child env.
+Fix:
+- Reword to: “sub-agent has unrestricted policy under Reins, but actual active tools are determined by child pi invocation settings/defaults.”
+- If 7 tools are required, specify explicit `--tools read,bash,edit,write,grep,find,ls` in spawned args.
 
-#### Reality
-`pi.exec()` **does not support `env`** overrides. `ExecOptions` only has:
-- `signal`
-- `timeout`
-- `cwd`
+### 5) ARCH “compilable skeleton” is not type-correct as written
 
-Therefore, the `pi.exec()` path is incompatible with the plan’s own main/sub-agent detection strategy.
+Problem:
+- Tool execute snippets return `isError` in returned object.
+- `registerTool().execute` return type is `AgentToolResult` (`content` + optional `details`), not `isError`.
 
-#### Required correction
-Make all docs unambiguous:
-- **Reins must use `child_process.spawn()`** for both delegate tool and context builder subprocesses if child env markers are required.
-- Remove language implying `pi.exec()` is a viable equivalent for this design.
+Impact:
+- Readers implementing from spec will produce type errors or incorrect runtime assumptions.
 
-### 2) Timeout + stale-cache logic mismatch
+Fix:
+- Remove `isError` from tool `execute` return examples.
+- Show error return as normal `content` text or throw, consistent with framework patterns.
 
-#### Current spec intent
-- On timeout, prefer stale cache fallback if available.
+### 6) Config resolution samples are internally inconsistent on scope usage
 
-#### Current pseudocode behavior
-- `Promise.race([buildPromise, timeoutPromise])` timeout resolves as partial result.
-- Cache fallback is shown in `catch`, which won’t execute for timeout-resolution path.
+Problem:
+- Hooks in samples call `getReinsConfig()` without passing `ctx.cwd`.
+- Same docs require project overrides to be respected.
 
-#### Result
-Documented fallback behavior and shown implementation are inconsistent.
+Impact:
+- Implementations following samples can accidentally ignore project settings in hooks.
 
-#### Required correction
-Choose one consistent algorithm and reflect it everywhere. Recommended:
-- Timeout path explicitly checks cache before returning no-context.
-- Reserve `catch` for hard process failure.
+Fix:
+- Make `getReinsConfig(ctx.cwd)` mandatory in all hook examples.
+- Add one explicit note: hook resolution is cwd-sensitive.
 
-Example behavior contract:
-1. Success -> use fresh context, update cache.
-2. Timeout -> if partial context available use partial; else if stale cache exists use stale; else none.
-3. Error -> if stale cache exists use stale; else none.
+## High-Value Improvements (Should Fix)
 
-## High-Impact Consistency Gaps
+### 7) Tighten non-interactive behavior specification
 
-### 3) Global toggle writing vs project override precedence
+Current docs partially acknowledge no-op UI but still include user-facing command copy for these modes.
 
-`/reins on|off` writing global settings is fine, but project-level `reins.enabled` can override and make global toggles look ineffective in a repo.
+Improve by defining one explicit matrix:
+- interactive: `ui.notify` visible
+- rpc: UI events emitted to client
+- print/json: `ui.notify` no-op
+- and exact fallback behavior (if any) for warnings/statuses
 
-Improve UX contract:
-- `/reins status` should report both effective value and source scope (global/project).
-- `/reins on` should warn if overridden by project config.
+### 8) Resolve spawn-strategy narrative drift everywhere
 
-### 4) Main-agent detection guarantee is overstated in places
+Most docs correctly standardize on `child_process.spawn()`, but wording still occasionally leaves ambiguity around `pi.exec` viability.
 
-Some sections state env marker strategy “ensures” only main agent is restricted; other sections correctly call out limitation with external subagent mechanisms.
+Improve by adding one single canonical statement in PRD/ARCH/UX:
+- `pi.exec` is fine for simple command execution,
+- but Reins subprocess spawning uses `spawn()` because child env tagging is required.
 
-Unify language to:
-- “Best-effort for Reins-spawned subprocesses; no framework-level parent/depth API currently exists.”
+### 9) Clarify path-resolution behavior for `settings.extensions`
 
-### 5) Circuit breaker + no-UI behavior needs one canonical implementation path
+Some examples imply direct absolute paths only. In reality, path resolution supports absolute/`~`/relative via loader rules.
 
-The UX spec mixes:
-- `ctx.ui.notify` escalation
-- fallback steer/system injection when `ctx.hasUI === false`
+Improve by explicitly documenting relative-path interpretation and recommending absolute paths for reproducibility.
 
-This is workable, but should be codified in ARCH as one deterministic decision tree, not scattered narrative.
+### 10) Normalize claims about “invisible” tool blocks
 
-## Medium Gaps / Clarifications Needed
+Docs mostly do this well, but some phrasing still implies user invisibility as default certainty.
 
-### 6) Config I/O robustness
+Improve by explicitly separating:
+- model visibility (yes, sees block error)
+- user visibility (usually no in chat, but model may surface it)
 
-Planned JSON read/write behavior should include:
-- Atomic write strategy (temp file + rename)
-- Recovery behavior for invalid JSON
-- File permission/ownership edge-case handling
+### 11) Strengthen test matrix with framework-realistic assertions
 
-### 7) Token accounting language
+Adjust tests to real runtime semantics:
+- non-interactive command execution does not imply visible `ui.notify` output
+- subprocess default tool set is 4 unless overridden
+- builder prompt is post-expansion
+- status field set excludes unavailable API data
 
-The docs use `chars/4` estimate. Good as heuristic, but should avoid presenting these as true token counts in status language.
+## Lower-Priority Improvements
 
-### 8) Multi-extension interaction risk
+### 12) Eliminate unresolved editorial contradictions in ARCH
 
-If other extensions modify system prompt or block tools, current docs don’t define precedence/diagnostics strategy. Should include:
-- deterministic ordering assumptions
-- debug trace mode for chained `before_agent_start` and `tool_call` decisions
+There are sections that intentionally self-correct midstream (e.g., allowed tools default sentence). Good thought process, but final spec should remove transitional text.
 
-### 9) Recursion safety explanation should match exact execution paths
+### 13) Make status telemetry fields explicitly optional
 
-Current recursion claims are plausible, but should explicitly state which process invocations load extensions and when `REINS_SUBAGENT` gate applies.
+Fields like last-build/cache age can be null before first run. Mark output format accordingly.
 
-## Document-by-Document Improvement Checklist
+### 14) Add one normative config schema block
 
-## `docs/PRD.md`
+Centralize final config keys with types/defaults and mark any v2 keys clearly.
 
-- Remove `pi.exec()` as an equivalent subprocess mechanism when env tagging is required.
-- Tighten acceptance criteria for timeout/cache behavior to match real implementation path.
-- Add explicit “effective config source” requirement for `/reins status`.
+## Suggested Doc Edits by File
 
-## `docs/ARCH.md`
+### `docs/PRD.md`
+- Replace “raw prompt” wording with “effective prompt as seen by `before_agent_start`.”
+- Constrain memory/history claims to what subprocess can actually access.
+- Update success criteria to exclude extension-load-order reporting unless framework API exists.
 
-- Replace any residual ambiguous language about subprocess spawning with one canonical approach.
-- Fix timeout/cache pseudocode mismatch.
-- Convert `isMainAgent()` section from “guarantee” framing to “bounded heuristic with known blind spots”.
-- Add JSON settings write safety and corruption handling section.
-- Add explicit diagnostics format for blocked tool loops and extension-chain interactions.
+### `docs/ARCH.md`
+- Fix all `execute` examples to be type-correct (`AgentToolResult` shape).
+- Require `getReinsConfig(ctx.cwd)` in hook examples.
+- Adjust sub-agent tool-access wording to default-4-tools reality unless explicit `--tools` is set.
+- Remove any API references not in `ExtensionAPI` (notably extension list methods).
+- Add one canonical non-interactive output policy section.
 
-## `docs/UX-SPEC.md`
+### `docs/UX-SPEC.md`
+- Update non-interactive command UX to match no-op `ui.notify` reality.
+- Remove or re-scope “extension load order” status line.
+- Keep explicit note that block errors are model-visible and may be user-referenced.
 
-- Ensure status output includes scope source (`global`/`project`) and override warning.
-- Keep no-UI behavior deterministic and mirrored in architecture docs.
-- Clarify that block reasons may surface to the model and occasionally user-visible text.
+## Final Rating
 
-## Proposed Overall Revised Rating Rubric
+- API correctness: 8.5/10
+- Architecture feasibility: 8/10
+- Runtime fidelity to actual Pi behavior: 5.5/10
+- Internal consistency across docs: 6.5/10
+- Implementation readiness: 6.5/10
 
-- API correctness: **9/10**
-- Architecture feasibility: **7/10**
-- Operational reliability: **6.5/10**
-- Consistency across PRD/ARCH/UX docs: **7/10**
-- Implementation readiness: **7/10**
+**Overall: 7.0/10**
 
-Combined: **7.5/10**.
+## Evidence Reference (Primary)
 
-## Must-Fix Before Implementation Starts
-
-1. Resolve spawn strategy contradiction (`pi.exec` vs `spawn` with env).
-2. Correct timeout/cache control-flow mismatch.
-3. Define effective config source reporting and override UX in `/reins status`.
-4. Normalize `isMainAgent` guarantees to realistic bounded claims.
-
-## Nice-to-Fix Before Beta
-
-1. Add robust settings write strategy and recovery semantics.
-2. Add structured debug telemetry for extension interaction chain.
-3. Add explicit non-UI escalation behavior matrix.
-4. Add integration test matrix covering:
-   - interactive / print / rpc modes
-   - timeout + stale cache branches
-   - block-loop circuit-breaker paths
-   - project override precedence
-
-## Validation Artifacts Used
-
-Primary local source of truth checked:
 - `~/projects/pi-mono/packages/coding-agent/src/core/extensions/types.ts`
-- `~/projects/pi-mono/packages/coding-agent/src/core/extensions/runner.ts`
 - `~/projects/pi-mono/packages/coding-agent/src/core/extensions/wrapper.ts`
-- `~/projects/pi-mono/packages/coding-agent/src/core/exec.ts`
+- `~/projects/pi-mono/packages/coding-agent/src/core/extensions/runner.ts`
 - `~/projects/pi-mono/packages/coding-agent/src/core/agent-session.ts`
 - `~/projects/pi-mono/packages/coding-agent/src/core/tools/index.ts`
 - `~/projects/pi-mono/packages/coding-agent/src/core/extensions/loader.ts`
-- `~/projects/pi-mono/packages/coding-agent/docs/extensions.md`
-- `~/projects/pi-mono/packages/coding-agent/docs/settings.md`
+- `~/projects/pi-mono/packages/coding-agent/src/core/exec.ts`
 - `~/projects/pi-mono/packages/coding-agent/src/modes/print-mode.ts`
 - `~/projects/pi-mono/packages/coding-agent/src/modes/rpc/rpc-mode.ts`
+- `~/projects/pi-mono/packages/coding-agent/examples/extensions/subagent/index.ts`
+- `~/projects/pi-mono/packages/coding-agent/docs/extensions.md`
+- `~/projects/pi-mono/packages/coding-agent/docs/settings.md`
