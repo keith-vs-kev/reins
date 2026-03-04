@@ -152,7 +152,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "reins_delegate",
     label: "Delegate",
-    description: "Delegate a task to a sub-agent with full tool access",
+    description: "Delegate a task to a sub-agent with tools as specified in spawn args",
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
       model: Type.Optional(Type.String({ description: "Model ID override. Uses settings.reins.model if omitted." })),
@@ -160,7 +160,7 @@ export default function (pi: ExtensionAPI) {
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       // Spawns a pi sub-process via child_process.spawn() — see ARCH.md §3
       // ...
-      return { content: [{ type: "text", text: "..." }] };
+      return { content: [{ type: "text", text: "..." }], details: {} };
     },
   });
 
@@ -213,7 +213,7 @@ export default function (pi: ExtensionAPI) {
 
 - Runs as a sub-process: the extension spawns `pi` via `child_process.spawn()` with `--mode json -p --no-session` flags
 - **Model:** configurable via `settings.reins.model` (e.g. `claude-sonnet-4-20250514` — illustrative, not hardcoded)
-- Given: the user's raw prompt (from `event.prompt`)
+- Given: the effective prompt after skill/template expansion (from `event.prompt`)
 - Outputs: a structured context block, or nothing
 - Scope: codebase files, memory, docs — builder decides what's relevant
 

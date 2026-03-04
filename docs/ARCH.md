@@ -7,6 +7,8 @@
 
 > **Reins is a Pi extension.** It hooks into the Pi coding agent's event system to constrain the main agent to delegation-only mode. The extension registers a `reins_delegate` tool via `pi.registerTool()` that internally spawns `pi` sub-processes using `child_process.spawn()` (matching Pi's own subagent example extension).
 
+> **Spawn strategy:** Reins uses `child_process.spawn()` for **all** subprocess creation (both context builder and `reins_delegate`). `pi.exec()` is not used because its `ExecOptions` only exposes `signal`, `timeout`, and `cwd` — there is no `env` option, which is required for `REINS_SUBAGENT=1` tagging. `pi.exec()` remains suitable for simple non-Reins shell commands within other extensions.
+
 ---
 
 ## 1. Extension Structure
@@ -138,7 +140,7 @@ import { getReinsConfig } from "../config.js";
 export function registerToolCall(pi: ExtensionAPI) {
   pi.on("tool_call", (event, ctx) => {
     // ── Enabled guard ── MUST be first. No-op when Reins is off.
-    const config = getReinsConfig();
+    const config = getReinsConfig(ctx.cwd);
     if (!config.enabled) return;
 
     // Only restrict main agent — sub-agents need full tool access.
@@ -202,14 +204,14 @@ import { CONTEXT_BUILDER_MAX_TOKENS } from "../constants.js";
 export function registerBeforeAgentStart(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     // ── Enabled guard ── MUST be first. No-op when Reins is off.
-    const config = getReinsConfig();
+    const config = getReinsConfig(ctx.cwd);
     if (!config.enabled) return;
 
     // Only affect main agent (see ADR-002)
     if (!isMainAgent()) return;
 
     // 1. Build context (with timeout + stale-cache fallback)
-    // event.prompt is the user's prompt text (from BeforeAgentStartEvent)
+    // event.prompt is the effective prompt (post skill/template expansion, not raw user input)
     // event.systemPrompt is the current system prompt
     const prompt = event.prompt;
     const promptHash = hashPrompt(prompt);
@@ -301,8 +303,8 @@ export function registerDelegateTool(pi: ExtensionAPI) {
     name: "reins_delegate",
     label: "Delegate",
     description:
-      "Delegate a task to a sub-agent with full tool access. " +
-      "The sub-agent runs in an isolated context and returns a text result.",
+      "Delegate a task to a sub-agent. " +
+      "The sub-agent runs in an isolated context with tools as specified (defaults to all 7 built-in tools) and returns a text result.",
     parameters: Type.Object({
       task: Type.String({ description: "Detailed task description for the sub-agent" }),
       model: Type.Optional(
@@ -318,12 +320,15 @@ export function registerDelegateTool(pi: ExtensionAPI) {
     }),
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const config = getReinsConfig();
+      const config = getReinsConfig(ctx.cwd);
       const model = params.model ?? config.model;
       const args: string[] = ["--mode", "json", "-p", "--no-session"];
 
       if (model) args.push("--model", model);
-      if (params.tools?.length) args.push("--tools", params.tools.join(","));
+      // Default active tools are only 4: read, bash, edit, write.
+      // Explicitly pass tools so the sub-agent has what it needs.
+      const tools = params.tools?.length ? params.tools : ["read", "bash", "edit", "write", "grep", "find", "ls"];
+      args.push("--tools", tools.join(","));
 
       args.push(`Task: ${params.task}`);
 
@@ -335,9 +340,10 @@ export function registerDelegateTool(pi: ExtensionAPI) {
       });
 
       if (result.code !== 0) {
+        // AgentToolResult has no isError field — signal errors via content text.
+        // For hard failures, throw instead (Pi surfaces the error to the model).
         return {
           content: [{ type: "text", text: `Sub-agent failed (exit ${result.code}): ${result.stderr}` }],
-          isError: true,
         };
       }
 
@@ -351,12 +357,14 @@ export function registerDelegateTool(pi: ExtensionAPI) {
 }
 ```
 
+> **Error signalling:** `AgentToolResult<T>` is `{ content: (TextContent|ImageContent)[], details: T }` — there is no `isError` field in the type contract. To signal errors from `execute()`: return error text in `content` (the model reads it and self-corrects), or `throw` (Pi surfaces the exception as an error result). Note: `ToolResultEventResult` (the `tool_result` event handler return type) does have an optional `isError` field — but that's a different type used for post-execution result modification, not for `execute()` returns.
+
 ### 3.2 How It Works
 
 1. The LLM calls `reins_delegate` with a task description
 2. The tool's `execute()` function uses `child_process.spawn("pi", [...args])` to spawn a child `pi` process
 3. The child runs in JSON mode (`--mode json`), print mode (`-p`), with no session (`--no-session`)
-4. The child has full tool access (default active: `read`, `bash`, `edit`, `write`; available in registry: + `grep`, `find`, `ls`)
+4. The child has tools as specified in spawn args (Reins defaults to all 7: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` via explicit `--tools` flag)
 5. The child's environment includes `REINS_SUBAGENT=1` (set via `spawn()` env option — isolated to child, does not mutate parent `process.env`) so if Reins is loaded there, it won't restrict the sub-agent
 6. Output is captured from stdout, parsed, and returned to the LLM
 
@@ -482,14 +490,16 @@ async function spawnContextBuilder(
 
 | Input | Source | Purpose |
 |-------|--------|---------|
-| User's raw prompt | `event.prompt` from `before_agent_start` event | Understand intent |
-| Read-only tools | `read`, `grep`, `find`, `ls` (Pi built-in tools, lowercase) | Gather file contents and structure |
+| Effective prompt (post-expansion) | `event.prompt` from `before_agent_start` event — this is the prompt **after** skill/template expansion, not the raw user input | Understand intent |
+| Read-only tools | `read`, `grep`, `find`, `ls` — must be passed explicitly via `--tools read,grep,find,ls` | Gather file contents and structure |
+
+> **Note:** The builder subprocess runs with `--no-session` and therefore has **no session message history**. "Memory" in this context means file-based memory (workspace files like `MEMORY.md`, daily logs) that the builder can `read` from disk — not session state.
 
 ### 4.3 What It Does
 
 The context builder is a sub-process with read-only tool access. It:
 
-1. Receives the user's prompt
+1. Receives the effective prompt (post skill/template expansion)
 2. Uses `find` and `ls` to explore the workspace structure
 3. Uses `grep` to find relevant files
 4. Uses `read` to pull file contents
@@ -958,7 +968,7 @@ Extension handlers run in **discovery order** (the order extensions are loaded b
 - **`before_agent_start`:** Each handler receives the previous handler's output (chained). If extension A returns `{ systemPrompt: X }`, extension B's `event.systemPrompt` is `X`. Reins appends to whatever it receives.
 - **`tool_call`:** Each handler is called in order. The **first** handler to return `{ block: true }` wins — subsequent handlers are not called for that tool call.
 
-**Recommendation:** `/reins status` should include the extension load order as debug info (e.g., `Extension load order: reins (1 of 3)`). This helps diagnose unexpected behavior when multiple extensions interact.
+**Note:** There is no `ExtensionAPI` method to enumerate loaded extensions or determine load order. If Pi adds such an API in the future, `/reins status` could include load order as debug info.
 
 ### 9.3 Future Commands
 
@@ -1148,7 +1158,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "reins_delegate",
     label: "Delegate",
-    description: "Delegate a task to a sub-agent with full tool access",
+    description: "Delegate a task to a sub-agent (tools specified via --tools flag)",
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
     }),
@@ -1163,9 +1173,9 @@ export default function (pi: ExtensionAPI) {
       });
 
       if (result.code !== 0) {
+        // No isError on AgentToolResult — signal errors via content text
         return {
           content: [{ type: "text", text: `Sub-agent failed (exit ${result.code}): ${result.stderr}` }],
-          isError: true,
         };
       }
 
@@ -1190,7 +1200,7 @@ Rationale:
 - Blocked tool calls return `{ block: true, reason: "..." }`. Pi surfaces the `reason` string as an error result that the model sees. This is not invisible — the model receives the block reason and can self-correct.
 - This is a deliberate teaching mode: the model learns from block messages and stops attempting blocked tools over time.
 
-**Honesty note:** Blocked tool calls surface as error results in the conversation. They are typically internal (the user doesn't see them in the chat UI), but the model does see the error content and may reference it. Do not assume blocks are invisible to the model.
+**Visibility semantics:** Blocked tool calls surface as error results that the **model always sees** (it's a tool result error in the conversation). The **user usually doesn't see** the raw block message in the chat UI — unless the model references it in its response. This is consistent behaviour: the block is invisible to the user but visible to the model, enabling self-correction.
 
 **v2 consideration:** A config switch (`reins.hideBlockedTools: boolean`) could use `pi.setActiveTools()` to hide tools entirely, reducing token waste from the model attempting blocked tools. Deferred — v1 data on block rates will inform whether this is needed.
 
@@ -1200,27 +1210,40 @@ Rationale:
 
 Reins must work correctly across all Pi modes:
 
-| Mode | `ctx.hasUI` | `/reins` command | `ctx.ui.notify()` | Tool blocking |
-|------|------------|-----------------|-------------------|---------------|
-| Interactive | `true` | Available (tab-complete) | Works | ✅ Works |
-| RPC (`--mode rpc`) | `true` | Available (via `prompt`) | Emits to client | ✅ Works |
-| JSON (`--mode json`) | `false` | Executable (prompt text starting with `/` is parsed) | No-op | ✅ Works |
-| Print (`-p`) | `false` | Executable (prompt text starting with `/` is parsed) | No-op | ✅ Works |
+| Mode | `ctx.hasUI` | `/reins` command | `ctx.ui.notify()` | `ctx.ui.confirm()` | Fallback | Tool blocking |
+|------|------------|-----------------|-------------------|-------------------|----------|---------------|
+| Interactive | `true` | Available (tab-complete) | Works | Works | n/a | ✅ Works |
+| RPC (`--mode rpc`) | `true` | Available (via `prompt`) | Emitted to client | Emitted to client | n/a | ✅ Works |
+| JSON (`--mode json`) | `false` | Executable (prompt text starting with `/` is parsed) | **No-op** | **No-op** | `console.error()` / stderr | ✅ Works |
+| Print (`-p`) | `false` | Executable (prompt text starting with `/` is parsed) | **No-op** | **No-op** | `console.error()` | ✅ Works |
 
 Key implications:
 - **Tool blocking works in all modes** — the `tool_call` hook fires regardless of UI mode.
 - **Commands execute in all modes** — prompt text starting with `/` is parsed as a command in JSON/print modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere.
-- **`ctx.ui.notify()` no-ops in non-interactive modes.** The circuit breaker uses the following canonical decision tree:
+- **`/reins on|off` silently takes effect in non-interactive modes** — settings are written to disk, but `ctx.ui.notify()` is a no-op so the user sees no confirmation. The state change persists and takes effect immediately.
+- **`/reins status` in non-interactive modes** — since `ctx.ui.notify()` is a no-op, status output must use an alternative delivery mechanism. The canonical fallback is `console.error()` (stderr) so the output reaches the user without polluting stdout/JSON output.
+- **`ctx.ui.notify()` no-ops in non-interactive modes.** All command handlers and the circuit breaker must use the following canonical decision tree:
 
 ```ts
+// Canonical notification with non-interactive fallback
+function notifyOrFallback(ctx: ExtensionContext, message: string, level: string): void {
+  if (ctx.hasUI) {
+    ctx.ui.notify(message, level);
+  } else {
+    // No UI available (JSON/print mode) — write to stderr
+    console.error(`[reins] ${message}`);
+  }
+}
+
 // Circuit breaker notification — canonical decision tree
-if (ctx.hasUI === true) {
+if (ctx.hasUI) {
   ctx.ui.notify(message, "warning");
 } else {
-  // No UI available (JSON/print mode) — inject warning into the next
+  // No UI available — inject warning into the next
   // before_agent_start systemPrompt modification so the LLM sees it.
   pendingCircuitBreakerWarning = message;
-  // On next before_agent_start, prepend: `⚠️ ${pendingCircuitBreakerWarning}`
+  // Also log to stderr for operator visibility
+  console.error(`[reins] ${message}`);
 }
 ```
 - **Context builder works in all modes** — it spawns a subprocess and modifies the system prompt, which is mode-independent.
@@ -1262,13 +1285,17 @@ The `/reins status` command reports runtime telemetry. Each field has a defined 
 
 ```ts
 // State tracked in-memory for status reporting
+// All fields except toolBlockCount are null before the first context build.
+// Status output should handle null gracefully (e.g. "Last context build: n/a").
 interface ReinsSessionState {
-  lastBuildTimestamp: number | null;    // Date.now() after build completes
-  lastBuildStatus: "success" | "partial" | "timeout" | "failed" | null;
-  lastBuildTokenEstimate: number | null; // contextBlock.length / 4 — approximate, not true token count
-  toolBlockCount: number;                // Reset on session_start
+  lastBuildTimestamp: number | null;    // Date.now() after build completes. null before first build.
+  lastBuildStatus: "success" | "partial" | "timeout" | "failed" | null;  // null before first build.
+  lastBuildTokenEstimate: number | null; // contextBlock.length / 4 — approximate. null before first build.
+  toolBlockCount: number;                // Reset on session_start. Always 0 initially.
 }
 ```
+
+> **Nullable fields:** `lastBuildTimestamp`, `lastBuildStatus`, `lastBuildTokenEstimate`, and cache age are all `null` before the first context build runs. `/reins status` should display these as `n/a` or omit them entirely when null.
 
 ---
 
@@ -1292,6 +1319,24 @@ Must-have tests before implementation is considered complete:
 | T12 | Circuit breaker (3 blocks) | After 3 consecutive blocks in one turn, steering message injected |
 | T13 | Circuit breaker (5 blocks) | After 5 consecutive blocks, `ctx.ui.notify` warning fires |
 | T14 | `/prework` without Reins | Context built and injected; agent retains full tool access |
+
+---
+
+## Appendix: Normative Config Schema
+
+Single source of truth for all Reins config keys:
+
+| Key | Type | Default | Scope | Description |
+|-----|------|---------|-------|-------------|
+| `reins.enabled` | `boolean` | `false` | global + project | Master toggle. Default OFF. |
+| `reins.model` | `string` | `"claude-sonnet-4-20250514"` | global + project | Context builder model ID. Illustrative default — any valid model ID. |
+| `reins.timeoutMs` | `number` | `12000` | global + project | Context builder timeout in ms. |
+| `reins.allowedTools` | `string[]` | `["reins_delegate"]` | global + project | Tools allowed in delegation-only mode. |
+| `reins.cacheMaxAge` | `number` | `300000` | global + project | Context cache TTL in ms (5 min). |
+| `reins.debug` | `boolean` | `false` | global + project | Log context builder input/output to stderr. |
+| `reins.hideBlockedTools` | `boolean` | — | — | **v2 only.** Use `pi.setActiveTools()` to hide blocked tools entirely. |
+
+**Precedence:** Project (`.pi/settings.json`) overrides global (`~/.pi/agent/settings.json`) per-key. Unspecified keys fall through to global, then to hardcoded defaults.
 
 ---
 

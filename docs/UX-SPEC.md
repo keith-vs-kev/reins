@@ -60,7 +60,6 @@ Context builder: claude-sonnet-4-20250514  (global)
 Last context build: 12s ago — success (~1,247 tokens, estimated)
 Cache age: 12s
 Tool blocks this session: 0
-Extension load order: reins (1 of 2)
 ```
 
 Or with project overrides:
@@ -71,7 +70,6 @@ Context builder: claude-haiku-4-20250414   ⚠️ overridden by project config
 Last context build: 4m ago — partial (timeout, ~483 tokens, estimated)
 Cache age: 4m 12s
 Tool blocks this session: 3
-Extension load order: reins (1 of 2)
 ```
 
 Or when off:
@@ -102,7 +100,7 @@ The only moment Reins surfaces visually is in the `/reins status` response and i
 
 ## 3. Context Injection UX
 
-### What "invisible" means
+### What the user sees (and doesn't)
 
 The context builder runs once per user prompt (via `before_agent_start`, which fires once before the agent loop starts). The user **never sees**:
 
@@ -149,7 +147,7 @@ No error toast. No warning banner. The agent doesn't announce "I couldn't build 
 
 When the cuffed agent attempts a non-delegation tool call (shouldn't happen often with the soft layer, but the hard layer catches it):
 
-The agent receives `{ block: true, reason: "Reins: restricted to delegation only" }` and re-routes to delegation. The blocked attempt is typically internal — the user doesn't see it in the chat UI — but the model receives the block reason as an error result and may reference it in its response.
+The agent receives `{ block: true, reason: "Reins: restricted to delegation only" }` and re-routes to delegation. The **model always sees** the block reason (it's a tool result error). The **user usually doesn't see** the raw block message — unless the model references it in its response.
 
 **Implementation detail:** The `tool_call` event handler returns `{ block: true, reason: "..." }` (typed as `ToolCallEventResult`) for any tool not on the allow-list. Pi surfaces the `reason` string as an error result that the model sees. This means blocked tool calls are **not invisible** — they surface as error results that may influence the model's behavior. This is by design: it teaches the model to self-correct toward delegation.
 
@@ -253,7 +251,7 @@ One line. No drama. The user can retry or just proceed.
 
 Reins is primarily designed for interactive Pi sessions, but must behave correctly in all modes:
 
-- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command **is executable** — prompt text starting with `/` is parsed as a command in all modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere. Users can also configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. `ctx.ui.notify()` is a no-op — the circuit breaker warning (§4) will not surface visually. See ARCH.md §14 for the canonical decision tree: when `ctx.hasUI === false`, the warning is injected via the next `before_agent_start` systemPrompt modification.
+- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command **is executable** — prompt text starting with `/` is parsed as a command in all modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere. Users can also configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. **`ctx.ui.notify()` is a no-op** in these modes — `/reins on|off` silently writes settings (no user-visible confirmation); `/reins status` falls back to `console.error()` (stderr) for output. The circuit breaker warning (§4) also uses stderr as fallback, plus injects the warning into the next `before_agent_start` systemPrompt modification so the model sees it. See ARCH.md §14 for the full behavior matrix and canonical decision tree.
 - **RPC mode (`--mode rpc`):** `/reins` is available via the `prompt` RPC command. `ctx.ui.notify()` emits to the RPC client.
 
 ---
@@ -269,6 +267,7 @@ The `/reins status` output (§1) reports specific runtime data. Source of truth 
 | `Last context build:` | Time since last build + outcome | In-memory timestamp + status from last `buildContextWithTimeout` call. Resets on Pi restart. |
 | `Cache age:` | Time since last successful cache write | In-memory, `Date.now() - cacheEntry.timestamp`. Resets on restart. |
 | `Tool blocks this session:` | Count of blocked tool calls | In-memory counter incremented in `tool_call` hook. Resets on restart (per-session by design). |
-| `Extension load order:` | Position of Reins in extension discovery order | From `pi.getAllExtensions()` or equivalent. Debug info for multi-extension interaction. |
+
+> **Note:** Extension load order is not shown — `ExtensionAPI` has no method to enumerate loaded extensions.
 
 Token estimates in the status output use a rough `chars / 4` heuristic — this is an approximation, not a true token count. Status output shows `~X tokens (estimated)` to make this clear.
