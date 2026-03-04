@@ -21,7 +21,7 @@ The root cause: agents have too many tools and no structural constraint on how t
 
 ## Goals
 
-- **G1:** Strip the main agent's tool access to delegate-only — hard block, not a suggestion. Reins registers its own delegation tool (`reins_delegate`) via `pi.registerTool()`, which internally spawns `pi` sub-processes using `pi.exec()` (an extension-side API, not LLM-callable).
+- **G1:** Strip the main agent's tool access to delegate-only — hard block, not a suggestion. Reins registers its own delegation tool (`reins_delegate`) via `pi.registerTool()`, which internally spawns `pi` sub-processes using `child_process.spawn()` (matching Pi's own subagent example extension).
 - **G2:** Run a context builder sub-agent once per user prompt (via `before_agent_start`) that injects relevant context as a modified system prompt
 - **G3:** Toggleable via `/reins on|off|status` slash command, backed by persistent config in settings files
 - **G4:** Default OFF — zero impact until activated
@@ -76,7 +76,7 @@ As a developer, if the context builder fails or times out, I want the main agent
 
 ### Pi Built-in Tools (Reference)
 
-Pi's built-in LLM-callable tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. There are no built-in delegation, messaging, or TTS tools. Delegation must be provided by extensions — either the `subagent` example extension or a custom tool registered via `pi.registerTool()`.
+Pi's default active tools are: `read`, `bash`, `edit`, `write` (4 tools). Additional tools available in the registry: `grep`, `find`, `ls` (7 total). There are no built-in delegation, messaging, or TTS tools. Delegation must be provided by extensions — either the `subagent` example extension or a custom tool registered via `pi.registerTool()`.
 
 ### Components
 
@@ -94,9 +94,9 @@ User message
           │    - Reads prompt intent                       │
           │    - Searches files, memory, past turns        │
           │    - Returns: context block OR empty            │
-          │    - Model: claude-sonnet-4-20250514 (default)  │
+          │    - Model: settings.reins.model (configurable)  │
           │    - Timeout: 10-15s (Promise.race)            │
-          │    - On timeout: inject partial / stale cache   │
+          │    - On timeout: stale cache or proceed without  │
           │    - On failure: return void, proceed unblocked │
           │                                                │
           ├─── [2. Tool Restriction — Dual Layer] ────────┤
@@ -151,10 +151,10 @@ export default function (pi: ExtensionAPI) {
     description: "Delegate a task to a sub-agent with full tool access",
     parameters: Type.Object({
       task: Type.String({ description: "Task description for the sub-agent" }),
-      model: Type.Optional(Type.String({ description: "Model ID override (e.g. claude-sonnet-4-20250514)" })),
+      model: Type.Optional(Type.String({ description: "Model ID override. Uses settings.reins.model if omitted." })),
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      // Spawns a pi sub-process via pi.exec() internally — see ARCH.md §3
+      // Spawns a pi sub-process via child_process.spawn() — see ARCH.md §3
       // ...
       return { content: [{ type: "text", text: "..." }] };
     },
@@ -208,16 +208,16 @@ export default function (pi: ExtensionAPI) {
 ### Context Builder
 
 - Runs as a sub-process: the extension's `reins_delegate` tool or a dedicated builder function uses `pi.exec()` to spawn `pi` with `--mode json -p --no-session` flags
-- **Model:** `claude-sonnet-4-20250514` by default, user-configurable via `reins.model` in settings
+- **Model:** configurable via `settings.reins.model` (e.g. `claude-sonnet-4-20250514` — illustrative, not hardcoded)
 - Given: the user's raw prompt (from `event.prompt`)
 - Outputs: a structured context block, or nothing
 - Scope: codebase files, memory, docs — builder decides what's relevant
 
 **Failure handling:**
 - Extension implements its own timeout via `Promise.race` (no built-in timeout in Pi's event system)
-- **On timeout:** inject whatever partial context was gathered, or return stale cached results
+- **On timeout with stale cache:** inject previous cached context with caveat marker
+- **On timeout with no cache:** return `void`, agent proceeds unblocked without injected context
 - **On total failure:** return `void`, agent proceeds unblocked
-- **Partial results:** always inject partial context (partial > nothing), with a caveat marker (e.g. `[context: partial — builder timed out]`)
 - **Cache pattern:** cache previous context results; return stale cache on timeout for subsequent turns
 
 ### Tool Restriction (Dual-Layer Enforcement)
@@ -238,9 +238,9 @@ All open questions have been resolved or dropped.
 | # | Question | Resolution |
 |---|----------|------------|
 | OQ1 | How do you hard-restrict tool access? | **Resolved.** Dual-layer enforcement: `tool_call` event blocks non-delegation calls (hard), `before_agent_start` modifies system prompt (soft). `pi.setActiveTools()` exists but hides tools entirely — we want visible-but-blocked. |
-| OQ2 | Context builder model choice? | **Resolved.** Default to `claude-sonnet-4-20250514`, user-configurable via `reins.model` in settings. |
+| OQ2 | Context builder model choice? | **Resolved.** Configurable via `settings.reins.model`. Example: `claude-sonnet-4-20250514`. Startup warning if configured model unavailable. |
 | OQ3 | Cost model / token budget cap? | **Dropped.** Not relevant for v1. |
-| OQ4 | Context builder failure modes? | **Resolved.** Extension implements own timeout (Promise.race, 10–15s). Partial results injected with caveat marker. On total failure, return void — agent proceeds. Cache pattern for stale fallback on subsequent turns. |
+| OQ4 | Context builder failure modes? | **Resolved.** Extension implements own timeout (Promise.race, 10–15s). Outcomes: success / timeout+stale cache / timeout+no cache / failure. On total failure, return void — agent proceeds. Cache pattern for stale fallback on subsequent turns. |
 | OQ5 | How does cuffed agent communicate delegation plan? | **Resolved.** The agent's natural language response describes what it's delegating and why — no special UX needed. |
 
 ---
@@ -261,12 +261,12 @@ All open questions have been resolved or dropped.
 
 ### v1 — Core Harness (Pi Extension)
 - [ ] Pi extension scaffold (`~/.pi/agent/extensions/reins/index.ts`)
-- [ ] `reins_delegate` tool registered via `pi.registerTool()` — spawns `pi` sub-processes via `pi.exec()`
+- [ ] `reins_delegate` tool registered via `pi.registerTool()` — spawns `pi` sub-processes via `child_process.spawn()`
 - [ ] `/reins` slash command (on/off/status) via `pi.registerCommand` with `handler` callback
 - [ ] Config-backed toggle via `~/.pi/agent/settings.json` (global) with `.pi/settings.json` (project) override
 - [ ] `before_agent_start` event — context injection + soft tool restriction (fires once per user prompt)
 - [ ] `tool_call` event — hard tool restriction (dual-layer enforcement)
-- [ ] Context builder sub-process via `pi.exec()` to spawn `pi --mode json -p --no-session` (model: `claude-sonnet-4-20250514` default, configurable)
+- [ ] Context builder sub-process via `child_process.spawn()` to spawn `pi --mode json -p --no-session` (model: configurable via `settings.reins.model`)
 - [ ] Context builder timeout + cache pattern
 - [ ] `/prework <prompt>` explicit trigger via `pi.registerCommand`
 

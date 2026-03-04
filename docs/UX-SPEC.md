@@ -22,7 +22,8 @@ Consistent language for contributors working on Reins as a **Pi extension**.
 | **`tool_result` event** | Fires after tool execution; can modify the result |
 | **`before_agent_start` event** | Fires once per user prompt before the agent loop; used for prompt/context injection |
 | **Settings** | Pi config in `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project). Project overrides global. |
-| **Built-in tools** | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` — the only LLM tools Pi provides out of the box |
+| **Default active tools** | `read`, `bash`, `edit`, `write` — the 4 tools active by default (`codingTools`) |
+| **Available tools (registry)** | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` — all 7 tools in Pi's `allTools` registry |
 | **`pi.exec()`** | Extension-side API for running shell commands — NOT an LLM-callable tool |
 
 **Not used (these are OpenClaw concepts, not Pi):**
@@ -181,13 +182,13 @@ First time? Here's what changed:
 
 The three-bullet explainer appears **once** — first activation only. Subsequent `/reins on` shows the single-line confirmation.
 
-**Persistence:** The "has seen onboarding" flag is stored as a file at `~/.pi/agent/reins-onboarding-shown` (not via `pi.appendEntry()`, which is session-scoped and would not persist across sessions). See ARCH.md ADR-004.
+**Persistence:** The "has seen onboarding" flag is stored as a file at `~/.pi/agent/reins-onboarding-shown` (not via `pi.appendEntry()`, which persists in the current session file and survives restarts of that session, but is not global cross-session state). See ARCH.md ADR-004.
 
 ### Setup required
 
 None. The extension ships with sensible defaults:
 
-- Context builder model: `claude-sonnet-4-20250514`
+- Context builder model: configurable via `settings.reins.model` (e.g. `claude-sonnet-4-20250514`)
 - Timeout: 12s
 - Allowed tools: `reins_delegate` only (registered by the extension via `pi.registerTool()`)
 
@@ -210,10 +211,10 @@ Explicit, one-shot context building without enabling the always-on harness. Usef
 ```
 User: /prework refactor the auth middleware to use the new token service
 
-Agent: Context built (1,847 tokens, 3.1s). Ready — send your prompt.
+📋 Context built (1,847 tokens, ready). Send your prompt.
 ```
 
-The prework response is **one line**: confirmation with token count and time. No dump of what was gathered — the context is injected into the next turn's prompt silently (delivered via `pi.sendMessage()` with `{ deliverAs: "nextTurn" }`).
+The prework response is **one line**: confirmation with token count and status. No dump of what was gathered. The context is queued invisibly for the next turn via `pi.sendMessage()` with `display: false` and `{ deliverAs: "nextTurn" }` — the user never sees the raw context, only the one-line confirmation.
 
 ### `/prework` (no argument)
 
@@ -250,7 +251,7 @@ One line. No drama. The user can retry or just proceed.
 
 Reins is primarily designed for interactive Pi sessions, but must behave correctly in all modes:
 
-- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command is **not available** (commands require interactive or RPC mode). Users must configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. `ctx.ui.notify()` is a no-op — the circuit breaker warning (§4) will not surface, but tool blocking still enforces the constraint.
+- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command **is executable** — prompt text starting with `/` is parsed as a command in all modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere. Users can also configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. `ctx.ui.notify()` is a no-op — the circuit breaker warning (§4) will not surface visually; instead, when `ctx.hasUI === false`, a system prompt warning is injected via `before_agent_start` as fallback.
 - **RPC mode (`--mode rpc`):** `/reins` is available via the `prompt` RPC command. `ctx.ui.notify()` emits to the RPC client.
 
 ---

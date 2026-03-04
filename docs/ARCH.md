@@ -5,7 +5,7 @@
 **Date:** 2026-03-03
 **Companion:** [PRD](./PRD.md)
 
-> **Reins is a Pi extension.** It hooks into the Pi coding agent's event system to constrain the main agent to delegation-only mode. The extension registers a `reins_delegate` tool via `pi.registerTool()` that internally spawns `pi` sub-processes using `pi.exec()` (an extension-side API, not LLM-callable).
+> **Reins is a Pi extension.** It hooks into the Pi coding agent's event system to constrain the main agent to delegation-only mode. The extension registers a `reins_delegate` tool via `pi.registerTool()` that internally spawns `pi` sub-processes using `child_process.spawn()` (matching Pi's own subagent example extension).
 
 ---
 
@@ -39,7 +39,7 @@ reins/
 
 ### Discovery & Configuration
 
-Pi extensions have **no manifest file**. Discovery is by convention:
+Pi extensions are discovered by convention or via `package.json`:
 
 | Method | Path |
 |--------|------|
@@ -293,7 +293,7 @@ function truncateToTokenBudget(text: string, maxTokens: number): string {
 
 ## 3. Delegation Tool
 
-Pi has no built-in delegation tool. Its built-in LLM-callable tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. Reins must register its own delegation tool so the cuffed agent can spawn sub-agents.
+Pi has no built-in delegation tool. Pi's default active tools are `read`, `bash`, `edit`, `write` (4 tools), with `grep`, `find`, `ls` available in the registry (7 total). Reins must register its own delegation tool so the cuffed agent can spawn sub-agents.
 
 ### 3.1 Tool Registration
 
@@ -333,9 +333,8 @@ export function registerDelegateTool(pi: ExtensionAPI) {
 
       args.push(`Task: ${params.task}`);
 
-      // Note: pi.exec() does not support custom env vars. For sub-agent
-      // detection, use child_process.spawn() directly (matching Pi's own
-      // subagent example) with REINS_SUBAGENT=1 in the env.
+      // Use child_process.spawn() directly (matching Pi's own subagent
+      // example) with REINS_SUBAGENT=1 isolated to the child env.
       const result = await spawnPiSubprocess(args, {
         signal,
         env: { ...process.env, REINS_SUBAGENT: "1" },
@@ -361,25 +360,27 @@ export function registerDelegateTool(pi: ExtensionAPI) {
 ### 3.2 How It Works
 
 1. The LLM calls `reins_delegate` with a task description
-2. The tool's `execute()` function uses `pi.exec("pi", [...args])` to spawn a child `pi` process
+2. The tool's `execute()` function uses `child_process.spawn("pi", [...args])` to spawn a child `pi` process
 3. The child runs in JSON mode (`--mode json`), print mode (`-p`), with no session (`--no-session`)
-4. The child has full tool access (all built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`)
-5. The child's environment includes `REINS_SUBAGENT=1` (set via `child_process.spawn()` env option) so if Reins is loaded there, it won't restrict the sub-agent
+4. The child has full tool access (default active: `read`, `bash`, `edit`, `write`; available in registry: + `grep`, `find`, `ls`)
+5. The child's environment includes `REINS_SUBAGENT=1` (set via `spawn()` env option — isolated to child, does not mutate parent `process.env`) so if Reins is loaded there, it won't restrict the sub-agent
 6. Output is captured from stdout, parsed, and returned to the LLM
 
 ### 3.3 Key Design Note: `pi.exec()` / `spawn()` vs LLM Tools
 
-`pi.exec()` is an **extension-side API** — it executes shell commands from within extension code. The LLM agent **cannot** call `pi.exec()` directly. However, `pi.exec()` does not support custom environment variables (its `ExecOptions` only has `signal`, `timeout`, and `cwd`). For `reins_delegate`, we use `child_process.spawn()` directly (matching Pi's own `subagent` example extension) to set `REINS_SUBAGENT=1` in the subprocess environment.
+Reins uses `child_process.spawn()` directly (matching Pi's own `subagent` example extension) to spawn sub-processes. This is the canonical approach — it allows setting `REINS_SUBAGENT=1` in the child environment without mutating the parent's `process.env`.
 
 The flow is:
 
 ```
-LLM calls reins_delegate (LLM tool) → execute() runs spawn("pi", [...]) → spawns pi subprocess
+LLM calls reins_delegate (LLM tool) → execute() runs spawn("pi", [...], { env }) → spawns pi subprocess
 ```
 
 This distinction is critical: the LLM interacts with `reins_delegate` as a registered tool. The subprocess spawning is an implementation detail inside the tool's `execute()` function.
 
 > **Note on `subpi`:** The `subpi` CLI tool is an optional ecosystem convenience for spawning Pi sub-agents. It is **not required** by Reins. The canonical approach is to spawn `pi` directly via `child_process.spawn("pi", ["--mode", "json", "-p", "--no-session", ...])`, matching the pattern from Pi's official `subagent` example extension.
+
+> **Why not `pi.exec()`?** `pi.exec()` is an extension-side API for running shell commands, but its `ExecOptions` only has `signal`, `timeout`, and `cwd` — no `env` option. Since Reins needs to set `REINS_SUBAGENT=1` on the child only, `spawn()` is required.
 
 ---
 
@@ -389,7 +390,7 @@ The context builder is the intelligence layer. It decides what the main agent ne
 
 ### 4.1 Execution Model
 
-The context builder runs as a **sub-process spawned via `pi.exec()`** — an extension-side API (not an LLM tool). It invokes `pi` directly in print+JSON mode.
+The context builder runs as a **sub-process spawned via `child_process.spawn()`**. It invokes `pi` directly in print+JSON mode.
 
 The builder is granted **read-only tools only**: `read`, `grep`, `find`, `ls`. It cannot write, execute shell commands, or modify anything.
 
@@ -440,7 +441,9 @@ async function spawnContextBuilder(
       `Task: ${opts.userPrompt}`,
     ];
 
-    const result = await pi.exec("pi", args, {});
+    const result = await spawnPiSubprocess(args, {
+      env: { ...process.env, REINS_SUBAGENT: "1" },
+    });
 
     if (result.code !== 0) {
       return { context: undefined, partial: false };
@@ -516,9 +519,9 @@ Return markdown with relevant context, or the single word EMPTY if no context is
 
 ### 4.6 Recursion Safety
 
-The context builder runs as a sub-process (separate `pi` invocation). This means:
+The context builder runs as a sub-process (separate `pi` invocation via `child_process.spawn()`). This means:
 1. It loads its own extension instances independently
-2. The `REINS_SUBAGENT=1` env var is set, so `isMainAgent()` returns false
+2. The `REINS_SUBAGENT=1` env var is set (isolated to child via `spawn()` env option), so `isMainAgent()` returns false
 3. Even if Reins is loaded in the sub-process, the tool_call hook won't restrict it
 4. There is no risk of infinite recursion — the sub-process is a flat invocation, not a re-entrant hook
 
@@ -528,7 +531,8 @@ The context builder runs as a sub-process (separate `pi` invocation). This means
 
 ### Pi Built-in Tools (Reference)
 
-Pi's built-in LLM-callable tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+Pi's default active tools (`codingTools`): `read`, `bash`, `edit`, `write` (4 tools).
+Additional tools available in registry (`allTools`): `grep`, `find`, `ls` (7 total).
 
 There are **no** built-in tools named `subagents`, `sessions_spawn`, `message`, `tts`, `web_search`, `web_fetch`, `browser`, or `image`. Those are either OpenClaw concepts or third-party extension tools.
 
@@ -540,7 +544,7 @@ There are **no** built-in tools named `subagents`, `sessions_spawn`, `message`, 
 
 | Tool | Reason |
 |------|--------|
-| `reins_delegate` | Extension-provided delegation tool — registered by Reins via `pi.registerTool()`. Spawns sub-agents via `pi.exec()` internally. |
+| `reins_delegate` | Extension-provided delegation tool — registered by Reins via `pi.registerTool()`. Spawns sub-agents via `child_process.spawn()` internally. |
 
 ### Blocked (everything else)
 
@@ -582,7 +586,7 @@ The allowlist is configurable via settings under `reins.allowedTools`. This allo
   "extensions": ["~/.pi/agent/extensions/reins/index.ts"],
   "reins": {
     "enabled": false,                        // Master toggle. Default: false.
-    "model": "claude-sonnet-4-20250514",     // Context builder model. Concrete provider/model ID.
+    "model": "claude-sonnet-4-20250514",     // Context builder model. Illustrative — any valid model ID.
     "timeoutMs": 12000,                      // Context builder timeout in ms. Default: 12000.
     "allowedTools": ["reins_delegate"],       // Tools allowed in delegation mode.
     "cacheMaxAge": 300000,                   // Cache TTL in ms (5 min). Default: 300000.
@@ -664,7 +668,7 @@ export function getReinsConfig(cwd?: string): ReinsConfig {
 
   return {
     enabled: typeof merged.enabled === "boolean" ? merged.enabled : false,
-    model: typeof merged.model === "string" ? merged.model : "claude-sonnet-4-20250514",
+    model: typeof merged.model === "string" ? merged.model : "claude-sonnet-4-20250514", // fallback — warn at startup if unavailable
     timeoutMs: typeof merged.timeoutMs === "number" ? merged.timeoutMs : DEFAULT_TIMEOUT_MS,
     allowedTools: Array.isArray(merged.allowedTools) ? merged.allowedTools : ALLOWED_TOOLS,
     cacheMaxAge: typeof merged.cacheMaxAge === "number" ? merged.cacheMaxAge : DEFAULT_CACHE_MAX_AGE,
@@ -801,14 +805,21 @@ export function registerPreworkCommand(pi: ExtensionAPI) {
 
         const marker = result.partial ? " *(partial — timed out)*" : "";
 
-        // Inject as a custom message — appears in session, sent to LLM on next turn
+        // Queue invisible context for next turn — display: false hides from UI,
+        // content is delivered to LLM context on the next user prompt.
         pi.sendMessage(
           {
             customType: "reins_prework",
-            content: [{ type: "text", text: `📋 **Pre-gathered context**${marker}:\n\n${result.context}` }],
-            display: "ephemeral",
+            content: [{ type: "text", text: result.context }],
+            display: false,
           },
           { deliverAs: "nextTurn" },
+        );
+
+        // One-line user confirmation (separate from the invisible injection)
+        ctx.ui.notify(
+          `📋 Context built (${Math.round(result.context.length / 4)} tokens, ${marker ? "partial" : "ready"}). Send your prompt.`,
+          "info",
         );
       } catch {
         ctx.ui.notify("⚠️ Context builder failed.", "error");
@@ -832,7 +843,7 @@ export function registerPreworkCommand(pi: ExtensionAPI) {
 ### 8.2 Onboarding State
 
 - **Persisted in:** `~/.pi/agent/reins-onboarding-shown` (dedicated file)
-- **NOT** `pi.appendEntry()` — that's session-scoped, not persistent across sessions
+- **NOT** `pi.appendEntry()` — that persists in the current session file and survives restarts of that session, but is not global cross-session state
 - **Written once:** on first `/reins on`
 - **Read by:** `/reins on` command handler
 
@@ -895,7 +906,7 @@ Pi extensions compose naturally:
 
 - Multiple extensions can subscribe to `before_agent_start` — Pi chains `systemPrompt` modifications
 - Multiple extensions can subscribe to `tool_call` — any extension returning `{ block: true }` prevents the call
-- The context builder model is configurable — can use any model with a concrete provider/model ID
+- The context builder model is configurable via `settings.reins.model` — can use any valid model ID. Startup emits a warning if the configured model is unavailable.
 
 ### 9.2 Future Commands
 
@@ -945,7 +956,7 @@ v0.1.0 is the initial release. Config keys are additive — new keys get default
 
 **Rationale:** The env var approach is explicit and debuggable — but only if Reins controls the var. Relying on external env vars that may not exist is fragile.
 
-**Consequences:** Depends on the delegation tool setting `REINS_SUBAGENT=1`. If sub-agents are spawned via a different mechanism, they need to set this var.
+**Consequences:** Depends on the delegation tool setting `REINS_SUBAGENT=1`. Reins controls its own `reins_delegate` tool spawn, so it CAN reliably set this env var. However, sub-agents spawned via other mechanisms (e.g., the `subagent` example extension, manual `pi` invocations) will not have this marker and may be incorrectly restricted if Reins is loaded in their process. Pi's own subagent example does NOT set any env markers for sub-agent detection — there is no framework-level convention for this. This is an accepted limitation for v1.
 
 **Required validation:** End-to-end test that:
 1. Main agent with Reins enabled has tools blocked
@@ -959,7 +970,7 @@ v0.1.0 is the initial release. Config keys are additive — new keys get default
 
 **Context:** Pi has no built-in delegation tool. Its built-in LLM-callable tools are: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. The cuffed agent needs a way to spawn sub-agents.
 
-**Decision:** Reins registers a `reins_delegate` tool via `pi.registerTool()`. This tool's `execute()` function uses `pi.exec()` (extension-side API) to spawn `pi` sub-processes.
+**Decision:** Reins registers a `reins_delegate` tool via `pi.registerTool()`. This tool's `execute()` function uses `child_process.spawn()` to spawn `pi` sub-processes.
 
 **Alternative considered:** Depend on the `subagent` example extension being installed. Rejected because: (a) it's an example, not a guaranteed dependency; (b) Reins should be self-contained.
 
@@ -976,7 +987,7 @@ v0.1.0 is the initial release. Config keys are additive — new keys get default
 
 **Decision:** Persist the "onboarding shown" flag as a file at `~/.pi/agent/reins-onboarding-shown`.
 
-**Rejected alternative:** `pi.appendEntry("reins_onboarding", { shown: true })`. `appendEntry` writes session entries — they only exist within a single session and are not durable global state. Checking session entries on startup would only find the flag if it was set in the same session.
+**Rejected alternative:** `pi.appendEntry("reins_onboarding", { shown: true })`. `appendEntry` persists in the current session file and survives restarts of that session, but it is not global cross-session state. A new session would not have the flag.
 
 **Rationale:** A simple file is the most reliable cross-session persistence mechanism available in the Pi extension API.
 
@@ -1090,13 +1101,14 @@ export default function (pi: ExtensionAPI) {
       task: Type.String({ description: "Task description for the sub-agent" }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
-      // Set env var before spawning so sub-agent knows not to restrict itself.
-      // pi.exec() doesn't support env option directly — set on process level
-      // before spawn. In production, use child_process.spawn() with env option
-      // instead of pi.exec() for full control. See §3.1 for the real implementation.
-      process.env.REINS_SUBAGENT = "1";
+      // Use child_process.spawn() with env option so REINS_SUBAGENT=1 is
+      // isolated to the child process — never mutate parent process.env.
+      const { spawn } = await import("node:child_process");
       const args = ["--mode", "json", "-p", "--no-session", `Task: ${params.task}`];
-      const result = await pi.exec("pi", args, { signal });
+      const result = await spawnPiSubprocess(args, {
+        signal,
+        env: { ...process.env, REINS_SUBAGENT: "1" },
+      });
 
       if (result.code !== 0) {
         return {
@@ -1113,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-> **Note:** This skeleton omits the context builder, caching, and config persistence for clarity. It demonstrates the four core surfaces: command registration with `handler`, `before_agent_start` hook (appending to `event.systemPrompt`), `tool_call` hook (blocking), and `pi.registerTool()` for delegation. The `pi.exec()` call matches the pattern from Pi's own `subagent` example: `spawn("pi", ["--mode", "json", "-p", "--no-session", ...])`.
+> **Note:** This skeleton omits the context builder, caching, and config persistence for clarity. It demonstrates the four core surfaces: command registration with `handler`, `before_agent_start` hook (appending to `event.systemPrompt`), `tool_call` hook (blocking), and `pi.registerTool()` for delegation. The `spawn()` call matches the pattern from Pi's own `subagent` example: `spawn("pi", ["--mode", "json", "-p", "--no-session", ...], { env })`.
 
 ---
 
@@ -1138,15 +1150,15 @@ Reins must work correctly across all Pi modes:
 
 | Mode | `ctx.hasUI` | `/reins` command | `ctx.ui.notify()` | Tool blocking |
 |------|------------|-----------------|-------------------|---------------|
-| Interactive | `true` | Available | Works | ✅ Works |
+| Interactive | `true` | Available (tab-complete) | Works | ✅ Works |
 | RPC (`--mode rpc`) | `true` | Available (via `prompt`) | Emits to client | ✅ Works |
-| JSON (`--mode json`) | `false` | Not available | No-op | ✅ Works |
-| Print (`-p`) | `false` | Not available | No-op | ✅ Works |
+| JSON (`--mode json`) | `false` | Executable (prompt text starting with `/` is parsed) | No-op | ✅ Works |
+| Print (`-p`) | `false` | Executable (prompt text starting with `/` is parsed) | No-op | ✅ Works |
 
 Key implications:
 - **Tool blocking works in all modes** — the `tool_call` hook fires regardless of UI mode.
-- **`/reins` command is only available in interactive/RPC mode** — in JSON/print mode, configure via settings files directly.
-- **`ctx.ui.notify()` may no-op** in JSON/print modes. The circuit breaker warning (§7.1) will not surface in non-interactive modes. This is acceptable — non-interactive usage is typically automated and monitored via exit codes, not notifications.
+- **Commands execute in all modes** — prompt text starting with `/` is parsed as a command in JSON/print modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere.
+- **`ctx.ui.notify()` no-ops in non-interactive modes.** The circuit breaker warning (§4 in UX-SPEC) will not surface visually. Fallback: when `ctx.hasUI === false`, inject a system prompt warning via `before_agent_start` instead of relying on `ctx.ui.notify()`.
 - **Context builder works in all modes** — it spawns a subprocess and modifies the system prompt, which is mode-independent.
 
 ---
