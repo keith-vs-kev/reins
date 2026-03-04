@@ -16,9 +16,14 @@ import { registerToolCall } from "./hooks/tool-call.js";
 import { registerReinsCommand } from "./commands/reins.js";
 import { registerPreworkCommand } from "./commands/prework.js";
 import { registerDelegateTool } from "./tools/delegate.js";
+import { getReinsConfig } from "./config.js";
 import { createSessionState } from "./state.js";
 
 export default function (pi: ExtensionAPI): void {
+  // Bail early when Reins is disabled — zero footprint, no hooks/tools registered.
+  const config = getReinsConfig(process.cwd());
+  if (!config.enabled) return;
+
   // Shared in-memory state for status telemetry and circuit breaker.
   const state = createSessionState();
 
