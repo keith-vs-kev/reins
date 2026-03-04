@@ -1,0 +1,16 @@
+{
+  "name": "reins",
+  "version": "0.1.0",
+  "description": "Delegation-only harness for the Pi coding agent",
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
