@@ -115,6 +115,7 @@ From the user's perspective, they send a message, the agent responds. The respon
 
 - **Slightly longer first-response time** — the context builder adds 2–15s of latency once per user prompt before the agent starts. This is the only observable side effect. No loading indicator is shown; the agent simply takes a beat longer to start responding.
 - **Better-informed responses** — the agent references files it wasn't explicitly pointed at, remembers context from previous sessions, surfaces relevant docs. This is the payoff.
+- **Citations for drill-down** — injected context includes references (e.g., `[file: src/auth.ts]`, `[url: https://...]`). The main agent uses these to provide more precise delegation instructions, and can "drill down" by asking a sub-agent to specifically read a cited source.
 - **No injected content in chat history** — the context is injected via system prompt modification (returned as `systemPrompt` from `before_agent_start`), not as a visible message. It does not appear in the conversation thread.
 
 ### Transparency (v2)

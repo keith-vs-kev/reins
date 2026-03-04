@@ -22,10 +22,11 @@ The root cause: agents have too many tools and no structural constraint on how t
 ## Goals
 
 - **G1:** Strip the main agent's tool access to delegate-only — hard block, not a suggestion. Reins registers its own delegation tool (`reins_delegate`) via `pi.registerTool()`, which internally spawns `pi` sub-processes using `child_process.spawn()` (matching Pi's own subagent example extension).
-- **G2:** Run a context builder sub-agent once per user prompt (via `before_agent_start`) that injects relevant context as a modified system prompt
+- **G2:** Run a context builder sub-agent once per user prompt (via `before_agent_start`) that injects relevant context (codebase + web research) as a modified system prompt
 - **G3:** Toggleable via `/reins on|off|status` slash command, backed by persistent config in settings files
 - **G4:** Default OFF — zero impact until activated
 - **G5:** Implemented as a Pi extension (`@mariozechner/pi-coding-agent`)
+- **G6:** Support citations/references in context builder output to allow the main agent to drill down into sources.
 
 ## Non-Goals / Out of Scope
 
@@ -43,12 +44,13 @@ The root cause: agents have too many tools and no structural constraint on how t
 **US1 — Enable the harness**
 As a developer, I want to run `/reins on` so that my agent is constrained to delegation-only mode for the rest of the session.
 
-**US2 — Context injection**
-As a developer, when I send a message to my agent, I want a context builder to automatically run first and inject relevant files, memory, and docs into the prompt — so the main agent starts with everything it needs.
+**US2 — Context injection (Codebase + Web)**
+As a developer, when I send a message to my agent, I want a context builder to automatically run first and inject relevant files, memory, and web research (docs, libraries, patterns) into the prompt — so the main agent starts with everything it needs.
 
 _Acceptance criteria:_
 - Given a prompt mentioning [feature X], the context builder injects at least one file path or memory snippet relevant to [feature X] within the timeout window.
-- Given a prompt with no clear file/code relevance, the builder returns EMPTY and no context is injected.
+- Given a prompt mentioning an unfamiliar library [lib Y], the context builder performs a web search and injects a summary of [lib Y]'s usage.
+- Given a prompt with no clear file/code/web relevance, the builder returns EMPTY and no context is injected.
 
 **US3 — Explicit prework**
 As a developer, I want to run `/prework <my prompt>` to manually trigger context building for a specific task, without enabling the always-on harness.
@@ -65,14 +67,15 @@ _Acceptance criteria:_
 - `/reins status` reports both effective value AND source scope (global/project) for each config key.
 - If a project config overrides a global config value, status shows `⚠️ overridden by project config`.
 
-_Persistence model:_ Toggle state is stored in Pi's settings files using the two-scope model:
-- **Global:** `~/.pi/agent/settings.json` → applies to all projects
-- **Project:** `.pi/settings.json` → overrides global for this project
-
-The `/reins on|off` command writes to the **global** settings file by default. A future version may support `--project` scope. Mid-session state (context cache, tool block counts) is in-memory and resets on restart — this is by design.
-
 **US6 — Graceful failure**
 As a developer, if the context builder fails or times out, I want the main agent to proceed unblocked — Reins should never be the reason a turn fails.
+
+**US7 — Citations and Drill-down**
+As a developer, I want the context builder to provide citations for its findings so that the main agent can choose to read specific source files or web pages if it needs more detail.
+
+_Acceptance criteria:_
+- Context builder output includes clear references (e.g., `[file: src/auth.ts]`, `[url: https://docs.example.com]`).
+- The main agent uses these citations to inform its delegation task descriptions.
 
 ---
 

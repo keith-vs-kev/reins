@@ -415,12 +415,11 @@ export async function buildContextWithTimeout(opts: {
   const { prompt, model, timeoutMs, pi, promptHash } = opts;
 
   const buildPromise = spawnContextBuilder(pi, {
-    systemPrompt: CONTEXT_BUILDER_SYSTEM_PROMPT,
-    userPrompt: `Gather context for the following user request:\n\n${prompt}`,
-    model,
-    tools: ["read", "grep", "find", "ls"],
+  systemPrompt: CONTEXT_BUILDER_SYSTEM_PROMPT,
+  userPrompt: `Gather context for the following user request:\n\n${prompt}`,
+  model,
+  tools: ["read", "grep", "find", "ls", "web_search", "web_fetch"],
   });
-
   const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) =>
     setTimeout(() => resolve(TIMEOUT_SENTINEL), timeoutMs),
   );
@@ -490,26 +489,30 @@ async function spawnContextBuilder(
 
 | Input | Source | Purpose |
 |-------|--------|---------|
-| Effective prompt (post-expansion) | `event.prompt` from `before_agent_start` event — this is the prompt **after** skill/template expansion, not the raw user input | Understand intent |
-| Read-only tools | `read`, `grep`, `find`, `ls` — must be passed explicitly via `--tools read,grep,find,ls` | Gather file contents and structure |
+| Effective prompt (post-expansion) | `event.prompt` from `before_agent_start` event | Understand intent (post skill/template expansion) |
+| Read-only tools | `read`, `grep`, `find`, `ls` | Gather file contents and structure |
+| Research tools | `web_search`, `web_fetch` | Research libraries, docs, and patterns |
 
 > **Note:** The builder subprocess runs with `--no-session` and therefore has **no session message history**. "Memory" in this context means file-based memory (workspace files like `MEMORY.md`, daily logs) that the builder can `read` from disk — not session state.
 
 ### 4.3 What It Does
 
-The context builder is a sub-process with read-only tool access. It:
+The context builder is a sub-process with read-only and research tool access. It:
 
 1. Receives the effective prompt (post skill/template expansion)
 2. Uses `find` and `ls` to explore the workspace structure
 3. Uses `grep` to find relevant files
 4. Uses `read` to pull file contents
-5. Returns a structured markdown summary of relevant context
+5. Uses `web_search` and `web_fetch` to look up documentation, libraries, or architectural patterns
+6. Returns a structured markdown summary of relevant context with citations
 
 ### 4.4 What It Returns
 
 A structured context block (plain text/markdown) containing any combination of:
 
 - **Relevant file contents** — files the main agent will need to reference when delegating
+- **Web research results** — documentation summaries, library usage patterns
+- **Citations** — references to local files (`[file: path]`) and web sources (`[url: link]`)
 - **Memory excerpts** — from MEMORY.md, daily logs, etc.
 - **Codebase structure** — directory trees, key file listings
 - **Nothing** — if the prompt is conversational or doesn't need codebase context (returns "EMPTY")
@@ -522,26 +525,32 @@ After the builder returns, the extension applies a **hard truncation cap** of 40
 // context-builder/prompt.ts
 export const CONTEXT_BUILDER_SYSTEM_PROMPT = `You are a context builder for an AI agent operating in delegation-only mode.
 
-You have read-only tools: read, grep, find, ls. Use them to explore the workspace
-and gather context the main agent needs to effectively delegate work.
+You have read-only tools: read, grep, find, ls, and research tools: web_search, web_fetch. Use them to explore the workspace
+and the web to gather context the main agent needs to effectively delegate work.
 
 ## What to gather
 - File contents directly relevant to the prompt (use read)
+- Documentation, library patterns, or concept research (use web_search, web_fetch)
 - Directory structure if the prompt involves code navigation (use ls, find)
 - Memory/context files if the prompt references past work (use read)
-- Config or schema files if the prompt involves system configuration (use read)
 - Search for relevant patterns (use grep)
+
+## Citations
+You MUST provide citations for all information gathered:
+- Local files: [file: path/to/file.ts]
+- Web sources: [url: https://...]
+Place citations next to the relevant information so the main agent knows where to look for more detail.
 
 ## Rules
 1. Be conservative — only include what's clearly relevant
 2. Prefer structure (file trees, signatures) over full file dumps
 3. If the prompt is conversational (greeting, question, chat), return EMPTY
 4. Keep total output under 4000 tokens
-5. Format as markdown sections with file paths as headers
+5. Format as markdown sections with file paths or web topics as headers
 6. If you're unsure whether something is relevant, skip it
 
 ## Output format
-Return markdown with relevant context, or the single word EMPTY if no context is needed.`;
+Return markdown with relevant context and citations, or the single word EMPTY if no context is needed.`;
 ```
 
 ### 4.6 Recursion Safety
