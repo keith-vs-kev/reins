@@ -158,15 +158,16 @@ export function registerToolCall(pi: ExtensionAPI) {
 }
 
 /**
- * Determine whether the current context is the main (top-level) agent.
+ * Best-effort heuristic for Reins-spawned subprocesses.
  *
- * Pi's ExtensionContext does NOT expose depth, parentSessionId, or parentId.
- * Reins sets REINS_SUBAGENT=1 on all sub-processes it spawns via reins_delegate.
- * Absence of this env var indicates we're the main (top-level) agent.
+ * No framework-level parent/depth API currently exists in Pi.
+ * Reins sets REINS_SUBAGENT=1 on sub-processes it spawns via reins_delegate.
+ * Absence of this env var is treated as "main agent" — but this is a
+ * bounded heuristic, not a guarantee. Sub-agents spawned by other
+ * mechanisms (e.g., the subagent example extension) will not have this
+ * marker and may be incorrectly restricted if Reins is loaded.
  *
- * ⚠️ ADR-002: This is an unresolved implementation risk. There is no
- * framework-level contract for sub-agent detection. This heuristic must
- * be validated with end-to-end tests.
+ * ⚠️ ADR-002: Unresolved implementation risk. Validate with e2e tests.
  */
 function isMainAgent(): boolean {
   return !process.env.REINS_SUBAGENT;
@@ -207,37 +208,29 @@ export function registerBeforeAgentStart(pi: ExtensionAPI) {
     // Only affect main agent (see ADR-002)
     if (!isMainAgent()) return;
 
-    // 1. Build context (with timeout + cache fallback)
+    // 1. Build context (with timeout + stale-cache fallback)
     // event.prompt is the user's prompt text (from BeforeAgentStartEvent)
     // event.systemPrompt is the current system prompt
     const prompt = event.prompt;
     const promptHash = hashPrompt(prompt);
-    let contextBlock: string | undefined;
-    let partial = false;
 
-    try {
-      const result = await buildContextWithTimeout({
-        prompt,
-        model: config.model,
-        timeoutMs: config.timeoutMs,
-        pi,
-      });
-      contextBlock = result.context;
-      partial = result.partial;
+    // buildContextWithTimeout handles timeout → stale cache → NO_CONTEXT
+    // and hard failure → stale cache → NO_CONTEXT internally (see §4.1)
+    const result = await buildContextWithTimeout({
+      prompt,
+      model: config.model,
+      timeoutMs: config.timeoutMs,
+      cacheMaxAge: config.cacheMaxAge,
+      promptHash,
+      pi,
+    });
 
-      // Hard truncation — never inject more than the token budget
-      if (contextBlock) {
-        contextBlock = truncateToTokenBudget(contextBlock, CONTEXT_BUILDER_MAX_TOKENS);
-      }
+    let contextBlock = result.context;
+    const partial = result.partial;
 
-      // Update cache on success
-      if (contextBlock && !partial) {
-        contextCache.set(promptHash, contextBlock, config.cacheMaxAge);
-      }
-    } catch {
-      // Total failure — try stale cache
-      contextBlock = contextCache.get(promptHash);
-      partial = !!contextBlock;
+    // Hard truncation — never inject more than the token budget
+    if (contextBlock) {
+      contextBlock = truncateToTokenBudget(contextBlock, CONTEXT_BUILDER_MAX_TOKENS);
     }
 
     // 2. Build system prompt modification
@@ -268,9 +261,10 @@ function isMainAgent(): boolean {
 
 /**
  * Hard-truncate context to a token budget.
- * Uses a rough 4 chars/token heuristic. This is a safety cap — the builder's
- * prompt already instructs it to stay under budget, but we enforce it here
- * programmatically so an LLM overshoot can't blow out the context window.
+ * Uses a rough chars/4 estimate (not a true token count). This is a safety
+ * cap — the builder's prompt already instructs it to stay under budget, but
+ * we enforce it here programmatically so an LLM overshoot can't blow out
+ * the context window.
  */
 function truncateToTokenBudget(text: string, maxTokens: number): string {
   const maxChars = maxTokens * 4;
@@ -366,7 +360,7 @@ export function registerDelegateTool(pi: ExtensionAPI) {
 5. The child's environment includes `REINS_SUBAGENT=1` (set via `spawn()` env option — isolated to child, does not mutate parent `process.env`) so if Reins is loaded there, it won't restrict the sub-agent
 6. Output is captured from stdout, parsed, and returned to the LLM
 
-### 3.3 Key Design Note: `pi.exec()` / `spawn()` vs LLM Tools
+### 3.3 Key Design Note: `child_process.spawn()` vs LLM Tools
 
 Reins uses `child_process.spawn()` directly (matching Pi's own `subagent` example extension) to spawn sub-processes. This is the canonical approach — it allows setting `REINS_SUBAGENT=1` in the child environment without mutating the parent's `process.env`.
 
@@ -380,7 +374,7 @@ This distinction is critical: the LLM interacts with `reins_delegate` as a regis
 
 > **Note on `subpi`:** The `subpi` CLI tool is an optional ecosystem convenience for spawning Pi sub-agents. It is **not required** by Reins. The canonical approach is to spawn `pi` directly via `child_process.spawn("pi", ["--mode", "json", "-p", "--no-session", ...])`, matching the pattern from Pi's official `subagent` example extension.
 
-> **Why not `pi.exec()`?** `pi.exec()` is an extension-side API for running shell commands, but its `ExecOptions` only has `signal`, `timeout`, and `cwd` — no `env` option. Since Reins needs to set `REINS_SUBAGENT=1` on the child only, `spawn()` is required.
+> **Why not `pi.exec()`?** Pi's `ExecOptions` only exposes `signal`, `timeout`, and `cwd` — there is no `env` option. Since Reins needs to set `REINS_SUBAGENT=1` on the child process only, `child_process.spawn()` is required. Do not use `pi.exec()` for subprocess spawning.
 
 ---
 
@@ -401,13 +395,16 @@ import { CONTEXT_BUILDER_SYSTEM_PROMPT } from "./prompt.js";
 
 type BuildResult = { context: string | undefined; partial: boolean };
 
+const TIMEOUT_SENTINEL = Symbol("timeout");
+
 export async function buildContextWithTimeout(opts: {
   prompt: string;
   model: string;
   timeoutMs: number;
   pi: ExtensionAPI;
+  promptHash: string;
 }): Promise<BuildResult> {
-  const { prompt, model, timeoutMs, pi } = opts;
+  const { prompt, model, timeoutMs, pi, promptHash } = opts;
 
   const buildPromise = spawnContextBuilder(pi, {
     systemPrompt: CONTEXT_BUILDER_SYSTEM_PROMPT,
@@ -416,11 +413,31 @@ export async function buildContextWithTimeout(opts: {
     tools: ["read", "grep", "find", "ls"],
   });
 
-  const timeoutPromise = new Promise<BuildResult>((resolve) =>
-    setTimeout(() => resolve({ context: undefined, partial: true }), timeoutMs),
+  const timeoutPromise = new Promise<typeof TIMEOUT_SENTINEL>((resolve) =>
+    setTimeout(() => resolve(TIMEOUT_SENTINEL), timeoutMs),
   );
 
-  return Promise.race([buildPromise, timeoutPromise]);
+  try {
+    const result = await Promise.race([buildPromise, timeoutPromise]);
+
+    if (result === TIMEOUT_SENTINEL) {
+      // Timeout path — check stale cache
+      const stale = contextCache.get(promptHash);
+      if (stale) return { context: stale, partial: true };
+      return { context: undefined, partial: true };
+    }
+
+    // Success — update cache
+    if (result.context) {
+      contextCache.set(promptHash, result.context, opts.cacheMaxAge ?? DEFAULT_CACHE_MAX_AGE);
+    }
+    return result;
+  } catch {
+    // Hard failure — check stale cache
+    const stale = contextCache.get(promptHash);
+    if (stale) return { context: stale, partial: true };
+    return { context: undefined, partial: false };
+  }
 }
 
 async function spawnContextBuilder(
@@ -520,10 +537,14 @@ Return markdown with relevant context, or the single word EMPTY if no context is
 ### 4.6 Recursion Safety
 
 The context builder runs as a sub-process (separate `pi` invocation via `child_process.spawn()`). This means:
-1. It loads its own extension instances independently
+1. The child `pi` process loads its **own** extensions from discovery paths independently
 2. The `REINS_SUBAGENT=1` env var is set (isolated to child via `spawn()` env option), so `isMainAgent()` returns false
 3. Even if Reins is loaded in the sub-process, the tool_call hook won't restrict it
 4. There is no risk of infinite recursion — the sub-process is a flat invocation, not a re-entrant hook
+
+**Extension loading in child processes:** When Reins spawns `pi` via `child_process.spawn()`, the child process loads extensions from its own discovery paths. If Reins is installed globally (e.g., in `~/.pi/agent/extensions/`), the child `pi` will **also** load Reins. This is exactly why the `REINS_SUBAGENT=1` environment gate matters — without it, the child would restrict itself. The env var is the sole mechanism preventing recursive restriction.
+
+This applies to both the context builder and the `reins_delegate` tool — any `pi` subprocess spawned by Reins must have `REINS_SUBAGENT=1` set.
 
 ---
 
@@ -635,7 +656,11 @@ let cachedGlobalMtime = 0;
 function readJsonFile(path: string): Record<string, unknown> {
   try {
     return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
+  } catch (err) {
+    // Invalid JSON or missing file — log warning, use defaults
+    if (existsSync(path)) {
+      console.warn(`[reins] Failed to parse ${path}: ${err}. Using defaults.`);
+    }
     return {};
   }
 }
@@ -679,12 +704,21 @@ export function getReinsConfig(cwd?: string): ReinsConfig {
 /**
  * Write reins.enabled to global settings.
  * Reads current file, updates reins.enabled, writes back atomically.
+ *
+ * Config I/O robustness:
+ * - Atomic write: write to temp file, rename to target (prevents partial writes on crash)
+ * - Invalid JSON recovery: readJsonFile catches parse errors, logs warning, returns {}
  */
 export async function setReinsEnabled(enabled: boolean): Promise<void> {
   const settings = readJsonFile(GLOBAL_SETTINGS_PATH) as Record<string, any>;
   if (!settings.reins) settings.reins = {};
   settings.reins.enabled = enabled;
-  writeFileSync(GLOBAL_SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+
+  // Atomic write: temp file + rename
+  const tmpPath = GLOBAL_SETTINGS_PATH + ".tmp";
+  writeFileSync(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+  renameSync(tmpPath, GLOBAL_SETTINGS_PATH);
+
   // Invalidate cache
   cachedGlobal = null;
 }
@@ -735,10 +769,19 @@ export function registerReinsCommand(pi: ExtensionAPI) {
 
       if (arg === "status" || arg === "") {
         const config = getReinsConfig(ctx.cwd);
-        const msg = config.enabled
-          ? `🔒 Reins: enabled (model: ${config.model})`
-          : "🔓 Reins: disabled";
-        ctx.ui.notify(msg, "info");
+        const configScopes = getReinsConfigScopes(ctx.cwd); // returns { key: "global"|"project" } per config key
+        const lines: string[] = [];
+
+        lines.push(`Reins: ${config.enabled ? "enabled" : "disabled"}  (${configScopes.enabled})`);
+        if (config.enabled) {
+          const modelScope = configScopes.model;
+          const modelLine = `Context builder: ${config.model}`;
+          lines.push(modelScope === "project" ? `${modelLine}  ⚠️ overridden by project config` : `${modelLine}  (${modelScope})`);
+          // ... session telemetry (lastBuild, cache, blocks) ...
+          lines.push(`Token estimates are approximate (~chars/4).`);
+        }
+
+        ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
 
@@ -908,14 +951,23 @@ Pi extensions compose naturally:
 - Multiple extensions can subscribe to `tool_call` — any extension returning `{ block: true }` prevents the call
 - The context builder model is configurable via `settings.reins.model` — can use any valid model ID. Startup emits a warning if the configured model is unavailable.
 
-### 9.2 Future Commands
+### 9.2 Multi-Extension Interaction
+
+Extension handlers run in **discovery order** (the order extensions are loaded by Pi):
+
+- **`before_agent_start`:** Each handler receives the previous handler's output (chained). If extension A returns `{ systemPrompt: X }`, extension B's `event.systemPrompt` is `X`. Reins appends to whatever it receives.
+- **`tool_call`:** Each handler is called in order. The **first** handler to return `{ block: true }` wins — subsequent handlers are not called for that tool call.
+
+**Recommendation:** `/reins status` should include the extension load order as debug info (e.g., `Extension load order: reins (1 of 3)`). This helps diagnose unexpected behavior when multiple extensions interact.
+
+### 9.3 Future Commands
 
 - `/reins config <key> <value>` — runtime config changes
 - `/reins allow <tool>` — temporarily allow a tool
 - `/reins log` — show what context was injected on the last turn
 - `/reins on --project` — write enabled state to project-scoped settings
 
-### 9.3 Versioning & Migration
+### 9.4 Versioning & Migration
 
 v0.1.0 is the initial release. Config keys are additive — new keys get defaults, removed keys are ignored.
 
@@ -999,10 +1051,10 @@ v0.1.0 is the initial release. Config keys are additive — new keys get default
 |------|--------|------------|------------|
 | **Context builder adds 5–12s latency per turn** | High — UX degradation | High | Timeout with stale cache fallback. `/prework` for explicit pre-build. |
 | **LLM ignores soft enforcement and tries blocked tools** | Medium — wasted tokens | Medium | Hard enforcement via `tool_call` catches all attempts. Soft layer reduces frequency. |
-| **Sub-agents also restricted** | Critical — delegation breaks | Low (mitigated by design) | `isMainAgent()` guard + `REINS_SUBAGENT` env var ensures only main agent is restricted. |
+| **Sub-agents also restricted** | Critical — delegation breaks | Low (mitigated by design) | `isMainAgent()` is a best-effort heuristic for Reins-spawned subprocesses via `REINS_SUBAGENT` env var. No framework-level parent/depth API currently exists in Pi. |
 | **Context builder injects irrelevant context** | Medium — misleading | Medium | Conservative builder prompt. Cache keyed by prompt hash. TTL. Debug mode. |
 | **Main agent identification unreliable** | High — blocks sub-agents or misses main | Low | ADR-002: env var is set explicitly by our delegation tool. |
-| **`pi.exec()` spawn overhead** | Medium — slower context building | Medium | Timeout + cache fallback. |
+| **`child_process.spawn()` overhead** | Medium — slower context building | Medium | Timeout + cache fallback. |
 | **Token cost of context injection** | Low — adds tokens per turn | High (by design) | Hard truncation at 4000 tokens. Cache reduces redundant builds. |
 
 ---
@@ -1158,7 +1210,19 @@ Reins must work correctly across all Pi modes:
 Key implications:
 - **Tool blocking works in all modes** — the `tool_call` hook fires regardless of UI mode.
 - **Commands execute in all modes** — prompt text starting with `/` is parsed as a command in JSON/print modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere.
-- **`ctx.ui.notify()` no-ops in non-interactive modes.** The circuit breaker warning (§4 in UX-SPEC) will not surface visually. Fallback: when `ctx.hasUI === false`, inject a system prompt warning via `before_agent_start` instead of relying on `ctx.ui.notify()`.
+- **`ctx.ui.notify()` no-ops in non-interactive modes.** The circuit breaker uses the following canonical decision tree:
+
+```ts
+// Circuit breaker notification — canonical decision tree
+if (ctx.hasUI === true) {
+  ctx.ui.notify(message, "warning");
+} else {
+  // No UI available (JSON/print mode) — inject warning into the next
+  // before_agent_start systemPrompt modification so the LLM sees it.
+  pendingCircuitBreakerWarning = message;
+  // On next before_agent_start, prepend: `⚠️ ${pendingCircuitBreakerWarning}`
+}
+```
 - **Context builder works in all modes** — it spawns a subprocess and modifies the system prompt, which is mode-independent.
 
 ---
@@ -1192,7 +1256,7 @@ The `/reins status` command reports runtime telemetry. Each field has a defined 
 | Context builder model | `reins.model` in settings file | Persistent | `claude-sonnet-4-20250514` |
 | Last build timestamp | In-memory, set after `buildContextWithTimeout` returns | Resets on Pi restart | `12s ago` |
 | Last build status | In-memory, set from build result | Resets on Pi restart | `success` / `partial` / `timeout` / `failed` |
-| Last build token estimate | In-memory, `contextBlock.length / 4` (rough heuristic) | Resets on Pi restart | `1,247 tokens` |
+| Last build token estimate | In-memory, `contextBlock.length / 4` (rough heuristic, not true token count) | Resets on Pi restart | `~1,247 tokens (estimated)` |
 | Cache age | In-memory, `Date.now() - cacheEntry.timestamp` | Resets on Pi restart | `12s` / `4m 12s` |
 | Tool blocks this session | In-memory counter, incremented in `tool_call` hook | Resets on Pi restart (per-session) | `0` / `3` |
 
@@ -1201,7 +1265,7 @@ The `/reins status` command reports runtime telemetry. Each field has a defined 
 interface ReinsSessionState {
   lastBuildTimestamp: number | null;    // Date.now() after build completes
   lastBuildStatus: "success" | "partial" | "timeout" | "failed" | null;
-  lastBuildTokenEstimate: number | null; // contextBlock.length / 4
+  lastBuildTokenEstimate: number | null; // contextBlock.length / 4 — approximate, not true token count
   toolBlockCount: number;                // Reset on session_start
 }
 ```

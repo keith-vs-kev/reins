@@ -61,6 +61,10 @@ _Deferred to v2._ In v1, context injection is invisible. v2 will add opt-in tran
 **US5 — Persistent toggle**
 As a developer, I want the harness enabled/disabled state to survive restarts so I don't have to re-enable it every session.
 
+_Acceptance criteria:_
+- `/reins status` reports both effective value AND source scope (global/project) for each config key.
+- If a project config overrides a global config value, status shows `⚠️ overridden by project config`.
+
 _Persistence model:_ Toggle state is stored in Pi's settings files using the two-scope model:
 - **Global:** `~/.pi/agent/settings.json` → applies to all projects
 - **Project:** `.pi/settings.json` → overrides global for this project
@@ -134,7 +138,7 @@ User message
 Slash command handler (registered via `pi.registerCommand`):
 - `/reins on` → sets `reins.enabled = true` in `~/.pi/agent/settings.json`
 - `/reins off` → sets to `false`
-- `/reins status` → reports current state
+- `/reins status` → reports current state, showing effective value AND source scope (global/project) for each config key. If a project config overrides global, shows `⚠️ overridden by project config`.
 
 ### Hook Registration
 
@@ -207,7 +211,7 @@ export default function (pi: ExtensionAPI) {
 
 ### Context Builder
 
-- Runs as a sub-process: the extension's `reins_delegate` tool or a dedicated builder function uses `pi.exec()` to spawn `pi` with `--mode json -p --no-session` flags
+- Runs as a sub-process: the extension spawns `pi` via `child_process.spawn()` with `--mode json -p --no-session` flags
 - **Model:** configurable via `settings.reins.model` (e.g. `claude-sonnet-4-20250514` — illustrative, not hardcoded)
 - Given: the user's raw prompt (from `event.prompt`)
 - Outputs: a structured context block, or nothing

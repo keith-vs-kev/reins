@@ -24,7 +24,7 @@ Consistent language for contributors working on Reins as a **Pi extension**.
 | **Settings** | Pi config in `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project). Project overrides global. |
 | **Default active tools** | `read`, `bash`, `edit`, `write` — the 4 tools active by default (`codingTools`) |
 | **Available tools (registry)** | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` — all 7 tools in Pi's `allTools` registry |
-| **`pi.exec()`** | Extension-side API for running shell commands — NOT an LLM-callable tool |
+| **`pi.exec()`** | Extension-side API for running shell commands (supports `signal`, `timeout`, `cwd` only — no `env`). NOT usable for subprocess spawning. Reins uses `child_process.spawn()` instead. |
 
 **Not used (these are OpenClaw concepts, not Pi):**
 `plugin`, `hook`, `gateway`, `OpenClawPluginApi`, `before_tool_call`, `before_prompt_build`, `blockReason`, `openclaw.plugin.json`, `api.registerHook()`.
@@ -55,21 +55,23 @@ That's it. One line. No explanation of what changed — the user ran the command
 ### `/reins status`
 
 ```
-Reins: enabled
-Context builder: claude-sonnet-4-20250514
-Last context build: 12s ago — success (1,247 tokens)
+Reins: enabled                          (global)
+Context builder: claude-sonnet-4-20250514  (global)
+Last context build: 12s ago — success (~1,247 tokens, estimated)
 Cache age: 12s
 Tool blocks this session: 0
+Extension load order: reins (1 of 2)
 ```
 
-Or with issues:
+Or with project overrides:
 
 ```
-Reins: enabled
-Context builder: claude-sonnet-4-20250514
-Last context build: 4m ago — partial (timeout, 483 tokens)
+Reins: enabled                          (global)
+Context builder: claude-haiku-4-20250414   ⚠️ overridden by project config
+Last context build: 4m ago — partial (timeout, ~483 tokens, estimated)
 Cache age: 4m 12s
 Tool blocks this session: 3
+Extension load order: reins (1 of 2)
 ```
 
 Or when off:
@@ -251,7 +253,7 @@ One line. No drama. The user can retry or just proceed.
 
 Reins is primarily designed for interactive Pi sessions, but must behave correctly in all modes:
 
-- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command **is executable** — prompt text starting with `/` is parsed as a command in all modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere. Users can also configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. `ctx.ui.notify()` is a no-op — the circuit breaker warning (§4) will not surface visually; instead, when `ctx.hasUI === false`, a system prompt warning is injected via `before_agent_start` as fallback.
+- **JSON mode (`--mode json`) / Print mode (`-p`):** The `/reins` command **is executable** — prompt text starting with `/` is parsed as a command in all modes. UI discoverability (tab-complete) is interactive-only, but command execution works everywhere. Users can also configure Reins via settings files directly (`reins.enabled: true` in `~/.pi/agent/settings.json`). Tool blocking works normally. `ctx.ui.notify()` is a no-op — the circuit breaker warning (§4) will not surface visually. See ARCH.md §14 for the canonical decision tree: when `ctx.hasUI === false`, the warning is injected via the next `before_agent_start` systemPrompt modification.
 - **RPC mode (`--mode rpc`):** `/reins` is available via the `prompt` RPC command. `ctx.ui.notify()` emits to the RPC client.
 
 ---
@@ -262,10 +264,11 @@ The `/reins status` output (§1) reports specific runtime data. Source of truth 
 
 | Field | What it shows | Where it comes from |
 |-------|--------------|-------------------|
-| `Reins: enabled/disabled` | Current toggle state | `reins.enabled` in settings file (persistent) |
-| `Context builder:` | Model used for context building | `reins.model` in settings file (persistent) |
+| `Reins: enabled/disabled` | Current toggle state + source scope | `reins.enabled` in settings file (persistent). Shows `(global)` or `(project)` scope. |
+| `Context builder:` | Model used + override warning | `reins.model` in settings file. Shows `⚠️ overridden by project config` if project differs from global. |
 | `Last context build:` | Time since last build + outcome | In-memory timestamp + status from last `buildContextWithTimeout` call. Resets on Pi restart. |
 | `Cache age:` | Time since last successful cache write | In-memory, `Date.now() - cacheEntry.timestamp`. Resets on restart. |
 | `Tool blocks this session:` | Count of blocked tool calls | In-memory counter incremented in `tool_call` hook. Resets on restart (per-session by design). |
+| `Extension load order:` | Position of Reins in extension discovery order | From `pi.getAllExtensions()` or equivalent. Debug info for multi-extension interaction. |
 
-Token estimates in the status output use a rough `chars / 4` heuristic — not precise, but directionally useful for the user.
+Token estimates in the status output use a rough `chars / 4` heuristic — this is an approximation, not a true token count. Status output shows `~X tokens (estimated)` to make this clear.
